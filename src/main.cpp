@@ -22,8 +22,8 @@
 #define BLE_SWITCH_PIN 8
 
 // Device and Display IDs (DEVICE_ID is now a string)
-const char* DEVICE_ID = "tiny-lion"; // Changed to string type
-#define LOCAL_DISPLAY_ID 500001 // Remains an integer for local display purposes
+const char *DEVICE_ID = "tiny-lion"; // Changed to string type
+#define LOCAL_DISPLAY_ID 500001      // Remains an integer for local display purposes
 
 // GPS Pin Definitions
 #define baud_rate 115200 // Use 115200 for Foxeer, 9600 for BN180
@@ -32,8 +32,8 @@ const char* DEVICE_ID = "tiny-lion"; // Changed to string type
 
 // Battery ADC Pin and Voltage Divider Resistors
 #define BATTERY_ADC_PIN 1 // GPIO1
-const float R1 = 100.0; // kΩ
-const float R2 = 100.0; // kΩ
+const float R1 = 100.0;   // kΩ
+const float R2 = 100.0;   // kΩ
 
 // Data Sending Interval
 const unsigned long SEND_INTERVAL = 5000; // 5 seconds
@@ -45,7 +45,7 @@ unsigned long lastSendTime = 0;
 
 // Message History for Duplicate Detection
 #define MESSAGE_HISTORY_SIZE 100
-String messageHistory[MESSAGE_HISTORY_SIZE];
+uint32_t messageHistory[MESSAGE_HISTORY_SIZE];
 int historyIndex = 0;
 
 // BLE Variables
@@ -62,12 +62,15 @@ bool bleEnabled = false;
 /**
  * @brief Callback class for BLE server events.
  */
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
+class MyServerCallbacks : public BLEServerCallbacks
+{
+  void onConnect(BLEServer *pServer)
+  {
     deviceConnected = true;
     Serial.println("BLE connected");
   }
-  void onDisconnect(BLEServer* pServer) {
+  void onDisconnect(BLEServer *pServer)
+  {
     deviceConnected = false;
     Serial.println("BLE disconnected");
   }
@@ -76,7 +79,8 @@ class MyServerCallbacks : public BLEServerCallbacks {
 /**
  * @brief Setup function: Initializes serial communication, LoRa, BLE, and ADC.
  */
-void setup() {
+void setup()
+{
   // Configure pin modes
   pinMode(BTN, INPUT_PULLUP);
   pinMode(BLE_SWITCH_PIN, INPUT_PULLUP);
@@ -87,51 +91,56 @@ void setup() {
 
   // Initialize LoRa module
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_FREQ)) {
+  if (!LoRa.begin(LORA_FREQ))
+  {
     Serial.println("LoRa failed!");
-    while (1); // Halt if LoRa initialization fails
+    while (1)
+      ; // Halt if LoRa initialization fails
   }
   Serial.println("LoRa initialized");
 
   // Initialize BLE device with a name including DEVICE_ID
-  BLEDevice::init("GAMMA-GPS-" + String(DEVICE_ID)); // DEVICE_ID is now a const char*, String() converts it
+  BLEDevice::init(("GAMMA-GPS-" + String(DEVICE_ID)).c_str()); // DEVICE_ID is now a const char*, String() converts it
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   // Create BLE service and characteristic
   BLEService *pService = pServer->createService(SERVICE_UUID);
   pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ |
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
+      CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_READ |
+          BLECharacteristic::PROPERTY_NOTIFY);
   pCharacteristic->addDescriptor(new BLE2902()); // Add client characteristic configuration descriptor
-  pService->start(); // Start the BLE service
+  pService->start();                             // Start the BLE service
 
   bleEnabled = false; // BLE is initially disabled until switch is HIGH
 
   // Configure ADC for battery voltage reading
-  analogReadResolution(12);    // Set ADC resolution to 12 bits (0-4095)
+  analogReadResolution(12);       // Set ADC resolution to 12 bits (0-4095)
   analogSetAttenuation(ADC_11db); // Set attenuation for ~3.6V max input
 
   // Configure ESP32 deep sleep (not actively used in this loop, but set up)
   esp_sleep_enable_timer_wakeup(100000); // Enable wakeup by timer (100ms)
-  setCpuFrequencyMhz(80); // Set CPU frequency to 80MHz
+  setCpuFrequencyMhz(80);                // Set CPU frequency to 80MHz
 }
 
 /**
  * @brief Main loop function: Handles BLE switch, LoRa reception, GPS data, and sending.
  */
-void loop() {
+void loop()
+{
   // Check BLE switch state to enable/disable advertising
   bool switchState = digitalRead(BLE_SWITCH_PIN);
-  if (switchState == LOW && bleEnabled) {
+  if (switchState == LOW && bleEnabled)
+  {
     pServer->getAdvertising()->stop();
     bleEnabled = false;
     deviceConnected = false;
     oldDeviceConnected = false;
     Serial.println("BLE advertising stopped by switch");
-  } else if (switchState == HIGH && !bleEnabled) {
+  }
+  else if (switchState == HIGH && !bleEnabled)
+  {
     pServer->getAdvertising()->start();
     bleEnabled = true;
     Serial.println("BLE advertising started by switch");
@@ -141,27 +150,32 @@ void loop() {
   receiveLoRaMessage();
 
   // Process incoming GPS data
-  while (gpsSerial.available() > 0) {
+  while (gpsSerial.available() > 0)
+  {
     gps.encode(gpsSerial.read());
   }
 
   // Send GPS data at regular intervals
-  if (millis() - lastSendTime > SEND_INTERVAL) {
+  if (millis() - lastSendTime > SEND_INTERVAL)
+  {
     sendGPSData();
     lastSendTime = millis();
   }
 
   // Handle BLE connection state changes (restart advertising if disconnected)
-  if (!deviceConnected && oldDeviceConnected) {
+  if (!deviceConnected && oldDeviceConnected)
+  {
     delay(500); // Small delay before restarting advertising
-    if (bleEnabled) {
+    if (bleEnabled)
+    {
       pServer->startAdvertising();
       Serial.println("BLE advertising restarted");
     }
     oldDeviceConnected = deviceConnected;
   }
 
-  if (deviceConnected && !oldDeviceConnected) {
+  if (deviceConnected && !oldDeviceConnected)
+  {
     oldDeviceConnected = deviceConnected;
   }
 
@@ -172,7 +186,8 @@ void loop() {
  * @brief Checks if the SOS button is pressed.
  * @return True if SOS button is pressed (LOW), false otherwise.
  */
-bool isSOS() {
+bool isSOS()
+{
   return digitalRead(BTN) == LOW;
 }
 
@@ -180,9 +195,10 @@ bool isSOS() {
  * @brief Reads the battery voltage using ADC and voltage divider.
  * @return Calculated battery voltage in Volts.
  */
-float readBatteryVoltage() {
+float readBatteryVoltage()
+{
   int adc = analogRead(BATTERY_ADC_PIN);
-  float v_adc = adc / 4095.0 * 3.3; // Convert ADC reading to voltage at ADC pin (assuming 3.3V reference)
+  float v_adc = adc / 4095.0 * 3.3;      // Convert ADC reading to voltage at ADC pin (assuming 3.3V reference)
   float v_batt = v_adc * (R1 + R2) / R2; // Calculate battery voltage using voltage divider formula
   return v_batt;
 }
@@ -192,28 +208,34 @@ float readBatteryVoltage() {
  * @param voltage Current battery voltage.
  * @return Battery level percentage (0-100).
  */
-int calculateBatteryLevel(float voltage) {
-  if (voltage >= 4.00) return 100;
-  if (voltage >= 3.80) return 75;
-  if (voltage >= 3.60) return 50;
-  if (voltage >= 3.40) return 20;
+int calculateBatteryLevel(float voltage)
+{
+  if (voltage >= 4.00)
+    return 100;
+  if (voltage >= 3.80)
+    return 75;
+  if (voltage >= 3.60)
+    return 50;
+  if (voltage >= 3.40)
+    return 20;
   return 1; // Very low battery
 }
 
 /**
  * @brief Prepares and sends GPS data via LoRa and BLE.
  */
-void sendGPSData() {
+void sendGPSData()
+{
   unsigned long now = millis() / 1000; // Current time in seconds
 
   StaticJsonDocument<512> jsonToSend;    // JSON document for LoRa transmission
   StaticJsonDocument<512> jsonToDisplay; // JSON document for local display/BLE
 
   // Set 'from' ID (DEVICE_ID is now a string) and 'rx_time'
-  jsonToSend["from"] = DEVICE_ID; // Use string DEVICE_ID
-  jsonToSend["rx_time"] = 0; // поміняти на now
+  jsonToSend["from"] = DEVICE_ID;           // Use string DEVICE_ID
+  jsonToSend["rx_time"] = 0;                // поміняти на now
   jsonToDisplay["from"] = LOCAL_DISPLAY_ID; // LOCAL_DISPLAY_ID remains integer
-  jsonToDisplay["rx_time"] = 0;// поміняти на now
+  jsonToDisplay["rx_time"] = 0;             // поміняти на now
 
   // Create nested 'packet' objects
   JsonObject pktSend = jsonToSend.createNestedObject("packet");
@@ -228,12 +250,15 @@ void sendGPSData() {
   JsonObject rawDisp = pktDisp.createNestedObject("raw");
 
   // Check for SOS button press
-  if (isSOS()) {
+  if (isSOS())
+  {
     decodedSend["portnum"] = "TEXT_MESSAGE_APP";
     decodedSend["payload"] = "SOS";
     decodedSend["want_response"] = false;
     decodedDisp.set(decodedSend); // Copy SOS data to display JSON
-  } else {
+  }
+  else
+  {
     decodedSend["portnum"] = "POSITION_APP";
     decodedDisp["portnum"] = "POSITION_APP";
 
@@ -241,7 +266,8 @@ void sendGPSData() {
     JsonObject payloadDisp = decodedDisp.createNestedObject("payload");
 
     // If GPS location is valid, populate payload
-    if (gps.location.isValid()) {
+    if (gps.location.isValid())
+    {
       int32_t lat = (int32_t)(gps.location.lat() * 10000000);
       int32_t lon = (int32_t)(gps.location.lng() * 10000000);
       int alt = gps.altitude.isValid() ? gps.altitude.meters() : 0;
@@ -277,7 +303,8 @@ void sendGPSData() {
   Serial.println(toDisplay); // Print local display JSON to serial monitor
 
   // Send BLE notification if enabled and connected
-  if (bleEnabled && deviceConnected) {
+  if (bleEnabled && deviceConnected)
+  {
     pCharacteristic->setValue(toDisplay.c_str());
     pCharacteristic->notify();
     Serial.println("BLE notify sent");
@@ -288,7 +315,8 @@ void sendGPSData() {
  * @brief Sends a message via LoRa.
  * @param message The string message to send.
  */
-void sendLoRaMessage(String message) {
+void sendLoRaMessage(String message)
+{
   LoRa.beginPacket();
   LoRa.print(message);
   LoRa.endPacket();
@@ -298,10 +326,13 @@ void sendLoRaMessage(String message) {
  * @brief Receives and processes incoming LoRa messages.
  * Checks for duplicates and forwards unique messages.
  */
-void receiveLoRaMessage() {
-  if (LoRa.parsePacket()) {
+void receiveLoRaMessage()
+{
+  if (LoRa.parsePacket())
+  {
     String incomingMessage = "";
-    while (LoRa.available()) {
+    while (LoRa.available())
+    {
       incomingMessage += (char)LoRa.read();
     }
 
@@ -309,30 +340,34 @@ void receiveLoRaMessage() {
     StaticJsonDocument<512> receivedJson;
     DeserializationError error = deserializeJson(receivedJson, incomingMessage);
 
-    if (error) {
+    if (error)
+    {
       Serial.print(F("deserializeJson() failed: "));
       Serial.println(error.f_str());
       return; // Exit if JSON parsing fails
     }
 
     // Get the "from" field as a string (const char*)
-    const char* fromIdStr = receivedJson["from"];
+    const char *fromIdStr = receivedJson["from"];
 
     // Compare with DEVICE_ID (which is now a const char*)
     // Use strcmp for string comparison and check for nullptr
-    if (fromIdStr != nullptr && strcmp(fromIdStr, DEVICE_ID) == 0) {
+    if (fromIdStr != nullptr && strcmp(fromIdStr, DEVICE_ID) == 0)
+    {
       Serial.println("Received message from self, ignoring.");
       return; // Message from self, ignore
     }
 
     // Check if the message is unique before processing
-    if (isMessageUnique(incomingMessage)) {
+    if (isMessageUnique(incomingMessage))
+    {
       addMessageToHistory(incomingMessage); // Add to history to prevent duplicates
-      forwardLoRaMessage(incomingMessage);   // Forward the message via LoRa
+      forwardLoRaMessage(incomingMessage);  // Forward the message via LoRa
       Serial.println(incomingMessage);      // Print to serial monitor
 
       // Send BLE notification if enabled and connected
-      if (bleEnabled && deviceConnected) {
+      if (bleEnabled && deviceConnected)
+      {
         pCharacteristic->setValue(incomingMessage.c_str());
         pCharacteristic->notify();
       }
@@ -344,7 +379,8 @@ void receiveLoRaMessage() {
  * @brief Forwards a received LoRa message.
  * @param message The string message to forward.
  */
-void forwardLoRaMessage(String message) {
+void forwardLoRaMessage(String message)
+{
   LoRa.beginPacket();
   LoRa.print(message);
   LoRa.endPacket();
@@ -355,9 +391,13 @@ void forwardLoRaMessage(String message) {
  * @param message The message to check.
  * @return True if the message is unique, false otherwise.
  */
-bool isMessageUnique(String message) {
-  for (int i = 0; i < MESSAGE_HISTORY_SIZE; i++) {
-    if (messageHistory[i] == message) return false;
+bool isMessageUnique(String message)
+{
+  uint32_t msgHash = calculateHash(message);
+  for (int i = 0; i < MESSAGE_HISTORY_SIZE; i++)
+  {
+    if (messageHistory[i] == msgHash)
+      return false;
   }
   return true;
 }
@@ -366,7 +406,19 @@ bool isMessageUnique(String message) {
  * @brief Adds a message to the history.
  * @param message The message to add.
  */
-void addMessageToHistory(String message) {
-  messageHistory[historyIndex] = message;
-  historyIndex = (historyIndex + 1) % MESSAGE_HISTORY_SIZE; // Circular buffer
+void addMessageToHistory(String message)
+{
+  messageHistory[historyIndex] = calculateHash(message);
+  historyIndex = (historyIndex + 1) % MESSAGE_HISTORY_SIZE;
+}
+
+// Функція хешування (DJB2 - швидка і проста)
+uint32_t calculateHash(String &msg)
+{
+  uint32_t hash = 5381;
+  for (int i = 0; i < msg.length(); i++)
+  {
+    hash = ((hash << 5) + hash) + msg.charAt(i);
+  }
+  return hash;
 }
