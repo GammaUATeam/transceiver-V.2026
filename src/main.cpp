@@ -43,17 +43,15 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 int loopCounter = 0;
 bool isLongListenMode = false;
 
-// --- КОНСТАНТИ БАТАРЕЇ (ПОКРАЩЕНО) ---
-const float R1 = 100.0; // Опір верхнього резистора (кОм)
-const float R2 = 100.0; // Опір нижнього резистора (кОм)
-// Підберіть цей коефіцієнт, порівнюючи з мультиметром!
-// Якщо показує менше ніж реальна - збільшіть (напр. 1.03), якщо більше - зменшіть.
+// --- КОНСТАНТИ БАТАРЕЇ ---
+const float R1 = 100.0;
+const float R2 = 100.0;
 const float BATTERY_CALIBRATION_FACTOR = 1.0;
 
-const float ADC_FILTER_ALPHA = 0.1;     // Більш плавний фільтр (було 0.2)
-const int ADC_SAMPLES = 20;             // Більше вибірок для точності (було 4)
-const float BATTERY_MIN_VOLTAGE = 3.20; // 0% (Li-ion зазвичай 3.0-3.2В розряджений)
-const float BATTERY_MAX_VOLTAGE = 4.20; // 100%
+const float ADC_FILTER_ALPHA = 0.1;
+const int ADC_SAMPLES = 20;
+const float BATTERY_MIN_VOLTAGE = 3.20;
+const float BATTERY_MAX_VOLTAGE = 4.20;
 float filteredBatteryVoltage = 0.0;
 
 // --- ОБ'ЄКТИ ---
@@ -119,6 +117,7 @@ BLEServer *pServer;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 bool bleEnabled = false;
+unsigned long lastBleRetryTime = 0; // Для неблокуючого таймера
 
 #define SERVICE_UUID "a066b5b0-c522-4aa9-b148-8f24f37fcba6"
 #define CHARACTERISTIC_UUID "d792d09f-1d6e-422b-991a-e2933e7d848b"
@@ -210,7 +209,6 @@ void setupPowerSaving()
   esp_pm_configure(&pm_config);
 }
 
-// === ФУНКЦІЯ РОЗРАХУНКУ CRC-16 ===
 uint16_t calculateCRC(uint8_t *data, size_t len)
 {
   uint16_t crc = 0;
@@ -342,7 +340,8 @@ void loop()
         }
       }
     }
-    delay(5);
+    // Зменшили з 5 до 1 мс для швидшої реакції
+    delay(1);
   }
   else
   {
@@ -352,7 +351,7 @@ void loop()
     delay(100);
   }
 
-  // BLE Management
+  // BLE Management (ВИПРАВЛЕНО БЛОКУВАННЯ)
   bool switchState = digitalRead(BLE_SWITCH_PIN);
   if (switchState == LOW && bleEnabled)
   {
@@ -366,15 +365,24 @@ void loop()
     bleEnabled = true;
   }
 
+  // Тут було delay(500), тепер неблокуючий код
   if (!deviceConnected && oldDeviceConnected)
   {
-    delay(500);
-    if (bleEnabled)
-      pServer->startAdvertising();
-    oldDeviceConnected = deviceConnected;
+    if (millis() - lastBleRetryTime > 500)
+    {
+      if (bleEnabled)
+        pServer->startAdvertising();
+
+      lastBleRetryTime = millis();
+      oldDeviceConnected = deviceConnected;
+    }
   }
+  // Цей блок має виконуватись відразу при підключенні
   if (deviceConnected && !oldDeviceConnected)
+  {
     oldDeviceConnected = deviceConnected;
+    lastBleRetryTime = 0;
+  }
 }
 
 void sleepLoRa()
@@ -388,8 +396,6 @@ void wakeLoRa()
   LoRa.receive();
   isLoRaAwake = true;
 }
-
-// --- RELAY LOGIC ---
 
 void enqueueRelay(LoRaPacket &packet)
 {
@@ -435,7 +441,6 @@ void processRelayQueue()
   }
 }
 
-// --- SEND LOGIC WITH CRC ---
 bool sendSafeLoRa(LoRaPacket &packet)
 {
   packet.crc = calculateCRC((uint8_t *)&packet, sizeof(LoRaPacket) - sizeof(uint16_t));
@@ -451,7 +456,7 @@ bool sendSafeLoRa(LoRaPacket &packet)
   }
 
   unsigned long jitter = random(10, 60);
-  delay(jitter);
+  delay(jitter); // Це блокування потрібне для CSMA
 
   if (LoRa.parsePacket() > 0)
     return false;
@@ -511,7 +516,7 @@ void receiveLoRaMessage(int packetSize)
 void sendGPSData()
 {
   LoRaPacket myPacket;
-  float vbat = readBatteryVoltage();
+  float vbat = readBatteryVoltage(); // Тут є затримка 40мс, але це допустимо
 
   memset(myPacket.deviceId, 0, 8);
   strncpy(myPacket.deviceId, DEVICE_ID_CONST, 8);
@@ -632,42 +637,28 @@ uint32_t calculatePacketHash(LoRaPacket &packet)
 
 bool isSOS() { return digitalRead(BTN) == LOW; }
 
-// === ОНОВЛЕНА ФУНКЦІЯ ВИМІРЮВАННЯ НАПРУГИ ===
 float readBatteryVoltage()
 {
-  // 1. Беремо 20 вибірок для видалення випадкових шумів
   uint32_t adcSum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++)
   {
     adcSum += analogRead(BATTERY_ADC_PIN);
-    delay(2); // Маленька пауза між вимірками
   }
   float adcAverage = (float)adcSum / (float)ADC_SAMPLES;
-
-  // 2. Розрахунок реальної напруги
-  // 3.3 - опорна напруга (може плавати, тому є коефіцієнт калібрування)
-  // (R1 + R2) / R2 - коефіцієнт дільника напруги
   float voltageDividerRatio = (R1 + R2) / R2;
   float rawVoltage = (adcAverage / 4095.0 * 3.3) * voltageDividerRatio * BATTERY_CALIBRATION_FACTOR;
 
-  // 3. Експоненціальний фільтр (згладжування)
   if (filteredBatteryVoltage == 0.0)
-    filteredBatteryVoltage = rawVoltage; // Перша ініціалізація
+    filteredBatteryVoltage = rawVoltage;
   else
     filteredBatteryVoltage = ADC_FILTER_ALPHA * rawVoltage + (1.0 - ADC_FILTER_ALPHA) * filteredBatteryVoltage;
 
   return filteredBatteryVoltage;
 }
 
-// === ОНОВЛЕНА ФУНКЦІЯ ВІДСОТКІВ (ЛІНІЙНА) ===
 int calculateBatteryLevel(float voltage)
 {
-  // Обрізаємо значення, щоб не виходило за межі
   float v = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
-
-  // Мапимо напругу (наприклад 3.2В...4.2В) у 0...100%
-  // Множимо на 100, бо map працює з цілими числами
   int percent = map(v * 100, BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100, 0, 100);
-
   return percent;
 }
