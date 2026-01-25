@@ -29,6 +29,8 @@
 
 // --- НАЛАШТУВАННЯ ПРИСТРОЮ ---
 const char *DEVICE_ID_CONST = "bug";
+const char *DEVICE_NAME = "Команда 1";
+
 #define LOCAL_DISPLAY_ID 500001
 const unsigned long SEND_INTERVAL = 5000;
 #define DEFAULT_TTL 3
@@ -44,6 +46,11 @@ bool isLongListenMode = false;
 // --- КОНСТАНТИ БАТАРЕЇ ---
 const float R1 = 100.0;
 const float R2 = 100.0;
+const float ADC_FILTER_ALPHA = 0.2;    // Експоненціальний фільтр (0.0-1.0)
+const int ADC_SAMPLES = 4;             // Кількість вибірок для усереднення
+const float BATTERY_MIN_VOLTAGE = 3.0; // Мінімальна напруга (0%)
+const float BATTERY_MAX_VOLTAGE = 4.2; // Максимальна напруга (100%)
+float filteredBatteryVoltage = 0.0;    // Глобальна змінна для фільтрованої напруги
 
 // --- ОБ'ЄКТИ ---
 HardwareSerial gpsSerial(1);
@@ -53,6 +60,7 @@ TinyGPSPlus gps;
 struct __attribute__((packed)) LoRaPacket
 {
   char deviceId[8];
+  char name[16];
   uint32_t uid;
   uint32_t timestamp;
   int32_t lat;
@@ -63,6 +71,8 @@ struct __attribute__((packed)) LoRaPacket
   uint8_t ttl;
   uint8_t type;
   uint8_t flags;
+  // === НОВЕ: КОНТРОЛЬНА СУМА ===
+  uint16_t crc;
 };
 
 #define FLAG_GPS_VALID 0x01
@@ -129,6 +139,7 @@ void sleepLoRa();
 void wakeLoRa();
 void processGPS(int maxBytes);
 void updateBLE(LoRaPacket &packet, bool isLocal);
+uint16_t calculateCRC(uint8_t *data, size_t len); // Прототип CRC
 
 // BLE Callbacks
 class MyServerCallbacks : public BLEServerCallbacks
@@ -165,6 +176,7 @@ void setup()
       delay(100);
   }
   LoRa.setTxPower(20);
+  LoRa.enableCrc(); // Вмикаємо також апаратний CRC LoRa для подвійного захисту
 
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
@@ -193,6 +205,24 @@ void setupPowerSaving()
       .min_freq_mhz = 80,
       .light_sleep_enable = true};
   esp_pm_configure(&pm_config);
+}
+
+// === ФУНКЦІЯ РОЗРАХУНКУ CRC-16 (XMODEM/CCITT) ===
+uint16_t calculateCRC(uint8_t *data, size_t len)
+{
+  uint16_t crc = 0;
+  for (size_t i = 0; i < len; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t j = 0; j < 8; j++)
+    {
+      if (crc & 0x8000)
+        crc = (crc << 1) ^ 0x1021;
+      else
+        crc <<= 1;
+    }
+  }
+  return crc;
 }
 
 void processGPS(int maxBytes)
@@ -402,13 +432,16 @@ void processRelayQueue()
   }
 }
 
-// --- CSMA/CA SEND LOGIC (Jitter Fix) ---
+// --- SEND LOGIC WITH CRC ---
 bool sendSafeLoRa(LoRaPacket &packet)
 {
+  // 1. Розрахунок CRC перед відправкою
+  // Ми рахуємо CRC для всього пакету мінус останні 2 байти (де зберігається сам CRC)
+  packet.crc = calculateCRC((uint8_t *)&packet, sizeof(LoRaPacket) - sizeof(uint16_t));
+
   if (!isLoRaAwake)
     wakeLoRa();
 
-  // 1. Перша перевірка
   int existingPacketSize = LoRa.parsePacket();
   if (existingPacketSize > 0)
   {
@@ -416,15 +449,12 @@ bool sendSafeLoRa(LoRaPacket &packet)
     return false;
   }
 
-  // 2. JITTER (Критично для Hidden Node та синхронного старту)
   unsigned long jitter = random(10, 60);
   delay(jitter);
 
-  // 3. Друга перевірка
   if (LoRa.parsePacket() > 0)
     return false;
 
-  // 4. Відправка
   if (LoRa.beginPacket() == 0)
     return false;
 
@@ -444,10 +474,22 @@ void receiveLoRaMessage(int packetSize)
   {
     while (LoRa.available())
       LoRa.read();
+    Serial.println("Error: Wrong packet size");
     return;
   }
 
   LoRa.readBytes((uint8_t *)&rxPacket, sizeof(LoRaPacket));
+
+  // === ПЕРЕВІРКА CRC ===
+  uint16_t receivedCRC = rxPacket.crc;
+  // Рахуємо, якою має бути CRC для цих даних
+  uint16_t calculatedCRC = calculateCRC((uint8_t *)&rxPacket, sizeof(LoRaPacket) - sizeof(uint16_t));
+
+  if (receivedCRC != calculatedCRC)
+  {
+    Serial.println("Error: CRC Mismatch! Packet Corrupted.");
+    return; // Ігноруємо битий пакет
+  }
 
   syncTimeFromMesh(rxPacket.timestamp, rxPacket.flags);
 
@@ -474,6 +516,10 @@ void sendGPSData()
 
   memset(myPacket.deviceId, 0, 8);
   strncpy(myPacket.deviceId, DEVICE_ID_CONST, 8);
+
+  memset(myPacket.name, 0, 16);
+  strncpy(myPacket.name, DEVICE_NAME, 16);
+  myPacket.name[15] = '\0';
 
   myPacket.uid = esp_random();
   myPacket.ttl = DEFAULT_TTL;
@@ -505,6 +551,9 @@ void sendGPSData()
     myPacket.altitude = 0;
   }
 
+  // CRC розраховується всередині sendSafeLoRa, але для історії хешу
+  // нам треба мати коректні дані, тому функція sendSafeLoRa модифікує myPacket
+  // додаючи туди CRC.
   if (sendSafeLoRa(myPacket))
   {
     addHashToHistory(calculatePacketHash(myPacket));
@@ -525,13 +574,17 @@ void updateBLE(LoRaPacket &packet, bool isLocal)
   docDisplay.clear();
 
   if (isLocal)
+  {
     docDisplay["id"] = LOCAL_DISPLAY_ID;
+    docDisplay["name"] = DEVICE_NAME;
+  }
   else
   {
     char idBuf[9];
     strncpy(idBuf, packet.deviceId, 8);
     idBuf[8] = '\0';
     docDisplay["id"] = idBuf;
+    docDisplay["name"] = packet.name;
   }
 
   docDisplay["t"] = packet.ttl;
@@ -585,19 +638,53 @@ bool isSOS() { return digitalRead(BTN) == LOW; }
 
 float readBatteryVoltage()
 {
-  int adc = analogRead(BATTERY_ADC_PIN);
-  return (adc / 4095.0 * 3.3) * (R1 + R2) / R2;
+  // Усереднення кількох вибірок для зменшення шумів
+  float adcSum = 0.0;
+  for (int i = 0; i < ADC_SAMPLES; i++)
+  {
+    adcSum += analogRead(BATTERY_ADC_PIN);
+    delay(2); // Невеликі затримки між вибірками
+  }
+  float adcAverage = adcSum / ADC_SAMPLES;
+
+  // Розрахунок сирої напруги
+  float rawVoltage = (adcAverage / 4095.0 * 3.3) * (R1 + R2) / R2;
+
+  // Експоненціальний фільтр для згладження коливань
+  if (filteredBatteryVoltage == 0.0)
+    filteredBatteryVoltage = rawVoltage; // Перша ініціалізація
+  else
+    filteredBatteryVoltage = ADC_FILTER_ALPHA * rawVoltage + (1.0 - ADC_FILTER_ALPHA) * filteredBatteryVoltage;
+
+  return filteredBatteryVoltage;
 }
 
 int calculateBatteryLevel(float voltage)
 {
-  if (voltage >= 4.00)
+  // Обмеження напруги в межах діапазону
+  if (voltage >= BATTERY_MAX_VOLTAGE)
     return 100;
-  if (voltage >= 3.80)
-    return 75;
-  if (voltage >= 3.60)
-    return 50;
-  if (voltage >= 3.40)
-    return 20;
-  return 1;
+  if (voltage <= BATTERY_MIN_VOLTAGE)
+    return 1;
+
+  // Лінійна характеристика з більшою точністю
+  float percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0;
+
+  // Уточнення для Li-ion батарей: крутіша крива в кінці розрядки
+  if (percentage < 15)
+  {
+    // Нелінійна поведінка при низькій напрузі
+    percentage = percentage * 0.8; // Прискорена розрядка в кінці
+  }
+
+  // Приведення до цілого числа
+  int level = (int)percentage;
+
+  // Обмеження діапазону 1-100
+  if (level < 1)
+    level = 1;
+  if (level > 100)
+    level = 100;
+
+  return level;
 }
