@@ -43,14 +43,18 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 int loopCounter = 0;
 bool isLongListenMode = false;
 
-// --- КОНСТАНТИ БАТАРЕЇ ---
-const float R1 = 100.0;
-const float R2 = 100.0;
-const float ADC_FILTER_ALPHA = 0.2;    // Експоненціальний фільтр (0.0-1.0)
-const int ADC_SAMPLES = 4;             // Кількість вибірок для усереднення
-const float BATTERY_MIN_VOLTAGE = 3.0; // Мінімальна напруга (0%)
-const float BATTERY_MAX_VOLTAGE = 4.2; // Максимальна напруга (100%)
-float filteredBatteryVoltage = 0.0;    // Глобальна змінна для фільтрованої напруги
+// --- КОНСТАНТИ БАТАРЕЇ (ПОКРАЩЕНО) ---
+const float R1 = 100.0; // Опір верхнього резистора (кОм)
+const float R2 = 100.0; // Опір нижнього резистора (кОм)
+// Підберіть цей коефіцієнт, порівнюючи з мультиметром!
+// Якщо показує менше ніж реальна - збільшіть (напр. 1.03), якщо більше - зменшіть.
+const float BATTERY_CALIBRATION_FACTOR = 1.0;
+
+const float ADC_FILTER_ALPHA = 0.1;     // Більш плавний фільтр (було 0.2)
+const int ADC_SAMPLES = 20;             // Більше вибірок для точності (було 4)
+const float BATTERY_MIN_VOLTAGE = 3.20; // 0% (Li-ion зазвичай 3.0-3.2В розряджений)
+const float BATTERY_MAX_VOLTAGE = 4.20; // 100%
+float filteredBatteryVoltage = 0.0;
 
 // --- ОБ'ЄКТИ ---
 HardwareSerial gpsSerial(1);
@@ -71,7 +75,6 @@ struct __attribute__((packed)) LoRaPacket
   uint8_t ttl;
   uint8_t type;
   uint8_t flags;
-  // === НОВЕ: КОНТРОЛЬНА СУМА ===
   uint16_t crc;
 };
 
@@ -139,7 +142,7 @@ void sleepLoRa();
 void wakeLoRa();
 void processGPS(int maxBytes);
 void updateBLE(LoRaPacket &packet, bool isLocal);
-uint16_t calculateCRC(uint8_t *data, size_t len); // Прототип CRC
+uint16_t calculateCRC(uint8_t *data, size_t len);
 
 // BLE Callbacks
 class MyServerCallbacks : public BLEServerCallbacks
@@ -176,7 +179,7 @@ void setup()
       delay(100);
   }
   LoRa.setTxPower(20);
-  LoRa.enableCrc(); // Вмикаємо також апаратний CRC LoRa для подвійного захисту
+  LoRa.enableCrc();
 
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
@@ -207,7 +210,7 @@ void setupPowerSaving()
   esp_pm_configure(&pm_config);
 }
 
-// === ФУНКЦІЯ РОЗРАХУНКУ CRC-16 (XMODEM/CCITT) ===
+// === ФУНКЦІЯ РОЗРАХУНКУ CRC-16 ===
 uint16_t calculateCRC(uint8_t *data, size_t len)
 {
   uint16_t crc = 0;
@@ -435,8 +438,6 @@ void processRelayQueue()
 // --- SEND LOGIC WITH CRC ---
 bool sendSafeLoRa(LoRaPacket &packet)
 {
-  // 1. Розрахунок CRC перед відправкою
-  // Ми рахуємо CRC для всього пакету мінус останні 2 байти (де зберігається сам CRC)
   packet.crc = calculateCRC((uint8_t *)&packet, sizeof(LoRaPacket) - sizeof(uint16_t));
 
   if (!isLoRaAwake)
@@ -480,15 +481,13 @@ void receiveLoRaMessage(int packetSize)
 
   LoRa.readBytes((uint8_t *)&rxPacket, sizeof(LoRaPacket));
 
-  // === ПЕРЕВІРКА CRC ===
   uint16_t receivedCRC = rxPacket.crc;
-  // Рахуємо, якою має бути CRC для цих даних
   uint16_t calculatedCRC = calculateCRC((uint8_t *)&rxPacket, sizeof(LoRaPacket) - sizeof(uint16_t));
 
   if (receivedCRC != calculatedCRC)
   {
     Serial.println("Error: CRC Mismatch! Packet Corrupted.");
-    return; // Ігноруємо битий пакет
+    return;
   }
 
   syncTimeFromMesh(rxPacket.timestamp, rxPacket.flags);
@@ -551,9 +550,6 @@ void sendGPSData()
     myPacket.altitude = 0;
   }
 
-  // CRC розраховується всередині sendSafeLoRa, але для історії хешу
-  // нам треба мати коректні дані, тому функція sendSafeLoRa модифікує myPacket
-  // додаючи туди CRC.
   if (sendSafeLoRa(myPacket))
   {
     addHashToHistory(calculatePacketHash(myPacket));
@@ -636,21 +632,25 @@ uint32_t calculatePacketHash(LoRaPacket &packet)
 
 bool isSOS() { return digitalRead(BTN) == LOW; }
 
+// === ОНОВЛЕНА ФУНКЦІЯ ВИМІРЮВАННЯ НАПРУГИ ===
 float readBatteryVoltage()
 {
-  // Усереднення кількох вибірок для зменшення шумів
-  float adcSum = 0.0;
+  // 1. Беремо 20 вибірок для видалення випадкових шумів
+  uint32_t adcSum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++)
   {
     adcSum += analogRead(BATTERY_ADC_PIN);
-    delay(2); // Невеликі затримки між вибірками
+    delay(2); // Маленька пауза між вимірками
   }
-  float adcAverage = adcSum / ADC_SAMPLES;
+  float adcAverage = (float)adcSum / (float)ADC_SAMPLES;
 
-  // Розрахунок сирої напруги
-  float rawVoltage = (adcAverage / 4095.0 * 3.3) * (R1 + R2) / R2;
+  // 2. Розрахунок реальної напруги
+  // 3.3 - опорна напруга (може плавати, тому є коефіцієнт калібрування)
+  // (R1 + R2) / R2 - коефіцієнт дільника напруги
+  float voltageDividerRatio = (R1 + R2) / R2;
+  float rawVoltage = (adcAverage / 4095.0 * 3.3) * voltageDividerRatio * BATTERY_CALIBRATION_FACTOR;
 
-  // Експоненціальний фільтр для згладження коливань
+  // 3. Експоненціальний фільтр (згладжування)
   if (filteredBatteryVoltage == 0.0)
     filteredBatteryVoltage = rawVoltage; // Перша ініціалізація
   else
@@ -659,32 +659,15 @@ float readBatteryVoltage()
   return filteredBatteryVoltage;
 }
 
+// === ОНОВЛЕНА ФУНКЦІЯ ВІДСОТКІВ (ЛІНІЙНА) ===
 int calculateBatteryLevel(float voltage)
 {
-  // Обмеження напруги в межах діапазону
-  if (voltage >= BATTERY_MAX_VOLTAGE)
-    return 100;
-  if (voltage <= BATTERY_MIN_VOLTAGE)
-    return 1;
+  // Обрізаємо значення, щоб не виходило за межі
+  float v = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
 
-  // Лінійна характеристика з більшою точністю
-  float percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0;
+  // Мапимо напругу (наприклад 3.2В...4.2В) у 0...100%
+  // Множимо на 100, бо map працює з цілими числами
+  int percent = map(v * 100, BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100, 0, 100);
 
-  // Уточнення для Li-ion батарей: крутіша крива в кінці розрядки
-  if (percentage < 15)
-  {
-    // Нелінійна поведінка при низькій напрузі
-    percentage = percentage * 0.8; // Прискорена розрядка в кінці
-  }
-
-  // Приведення до цілого числа
-  int level = (int)percentage;
-
-  // Обмеження діапазону 1-100
-  if (level < 1)
-    level = 1;
-  if (level > 100)
-    level = 100;
-
-  return level;
+  return percent;
 }
