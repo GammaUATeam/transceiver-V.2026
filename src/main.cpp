@@ -513,10 +513,21 @@ void receiveLoRaMessage(int packetSize)
   }
 }
 
+// === ОНОВЛЕНА ФУНКЦІЯ ВІДПРАВКИ ===
 void sendGPSData()
 {
+  bool emergency = isSOS();
+
+  // ЯКЩО НЕМАЄ GPS І НЕ НАТИСНУТО SOS -> ВИХОДИМО, НІЧОГО НЕ ВІДПРАВЛЯЄМО
+  if (!gps.location.isValid() && !emergency)
+  {
+    // Можна розкоментувати для дебагу, але краще мовчати
+    // Serial.println("Skipped: No GPS fix");
+    return;
+  }
+
   LoRaPacket myPacket;
-  float vbat = readBatteryVoltage(); // Тут є затримка 40мс, але це допустимо
+  float vbat = readBatteryVoltage();
 
   memset(myPacket.deviceId, 0, 8);
   strncpy(myPacket.deviceId, DEVICE_ID_CONST, 8);
@@ -533,7 +544,7 @@ void sendGPSData()
   time(&now);
   myPacket.timestamp = (uint32_t)now;
 
-  myPacket.type = isSOS() ? TYPE_SOS : TYPE_POS;
+  myPacket.type = emergency ? TYPE_SOS : TYPE_POS;
   myPacket.battery = calculateBatteryLevel(vbat);
   myPacket.voltage = (uint8_t)(vbat * 10);
 
@@ -550,6 +561,7 @@ void sendGPSData()
   }
   else
   {
+    // Сюди потрапимо ТІЛЬКИ якщо натиснуто SOS, але координати ще не зловили
     myPacket.lat = 0;
     myPacket.lon = 0;
     myPacket.altitude = 0;
@@ -559,6 +571,7 @@ void sendGPSData()
   {
     addHashToHistory(calculatePacketHash(myPacket));
     updateBLE(myPacket, true);
+    Serial.println("Packet sent!");
   }
   else
   {
@@ -566,7 +579,7 @@ void sendGPSData()
     nextSendTime += 1000;
   }
 }
-
+// ===================================
 void updateBLE(LoRaPacket &packet, bool isLocal)
 {
   if (!bleEnabled || !deviceConnected)
