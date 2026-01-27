@@ -275,9 +275,9 @@ void handleRoot()
 {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>LoRa Settings</title><style>body{font-family:sans-serif;padding:20px;background:#f0f0f0}input{display:block;width:100%;padding:10px;margin:10px 0;box-sizing:border-box}button{background:#007bff;color:white;padding:15px;border:none;width:100%;font-size:16px}</style></head><body>";
-  html += "<h2>Налаштування LoRa</h2>";
+  html += "<h2>Налаштування</h2>";
   html += "<form action='/save' method='POST'>";
-  html += "<label>Ім'я пристрою (до 15 символів):</label>";
+  html += "<label>Ім'я (до 15 символів):</label>";
   html += "<input type='text' name='devname' value='" + settings_name + "' maxlength='15'>";
   html += "<label>Ключ шифрування:</label>";
   html += "<input type='text' name='pass' value='" + settings_password + "'>";
