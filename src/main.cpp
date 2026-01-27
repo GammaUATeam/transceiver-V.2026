@@ -14,14 +14,27 @@
 #include <sys/time.h>
 #include "esp_system.h"
 
+// +++ ДОДАТКОВІ БІБЛІОТЕКИ ДЛЯ WIFI ТА НАЛАШТУВАНЬ +++
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+
 // +++ КРИПТОГРАФІЯ +++
 #include "mbedtls/aes.h"
 #include "mbedtls/sha256.h"
 
 // ==========================================
-// НАЛАШТУВАННЯ БЕЗПЕКИ
+// ЗМІННІ НАЛАШТУВАНЬ
 // ==========================================
-const char *AES_PASSWORD = "SuperStrongPassword123";
+String settings_password = "SuperStrongPassword123";
+String settings_name = "Команда 1";
+
+// Об'єкти для збереження та веб-сервера
+Preferences preferences;
+WebServer server(80);
+DNSServer dnsServer;
+bool isConfigMode = false;
 
 // УНІКАЛЬНИЙ ПІДПИС МЕРЕЖІ
 #define MESH_SIGNATURE 0xB5
@@ -32,39 +45,31 @@ bool isKeyInitialized = false;
 // ==========================================
 // СТРУКТУРА ПАКЕТУ
 // ==========================================
-
-// 1. ТІЛО ПАКЕТУ (Тільки те, що шифрується)
 struct __attribute__((packed)) LoRaBody
 {
   char deviceId[8];
   char name[16];
   uint32_t uid;
-  // timestamp забрали звідси
   int32_t lat;
   int32_t lon;
   int16_t altitude;
   uint8_t voltage;
   uint8_t battery;
-  // ttl забрали звідси
   uint8_t type;
-  // flags забрали звідси
   uint16_t crc;
 };
 
-// 2. ПОВНИЙ ОБ'ЄКТ (Для зберігання в пам'яті ESP32)
 struct FullPacket
 {
-  uint32_t timestamp; // Публічний
-  uint8_t flags;      // Публічний
-  uint8_t ttl;        // Публічний
-  LoRaBody body;      // Приватний (шифрується при відправці)
+  uint32_t timestamp;
+  uint8_t flags;
+  uint8_t ttl;
+  LoRaBody body;
 };
 
 // Розміри
-#define ENCRYPTED_SIZE sizeof(LoRaBody) // Розмір зашифрованої частини
+#define ENCRYPTED_SIZE sizeof(LoRaBody)
 #define IV_SIZE 16
-
-// Розмір в ефірі: [SIG 1] + [TTL 1] + [TIME 4] + [FLAGS 1] + [IV 16] + [BODY ...]
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
 // ==========================================
@@ -81,14 +86,12 @@ struct FullPacket
 #define GPS_RX 3
 #define GPS_TX 4
 
-const char *DEVICE_ID_CONST = "bug";
-const char *DEVICE_NAME = "Команда 1";
+const char *DEVICE_ID_CONST = "bug1";
 #define LOCAL_DISPLAY_ID 500001
 const unsigned long SEND_INTERVAL = 5000;
 #define DEFAULT_TTL 3
 #define baud_rate 9600 // Use 115200 for Foxeer, 9600 for BN180
 
-// --- CONSTANTS ---
 const int RX_WINDOW_SECONDS = 25;
 const int TX_WINDOW_SECONDS = 20;
 const int LONG_LISTEN_INTERVAL_CYCLES = 200;
@@ -116,7 +119,7 @@ float filteredBatteryVoltage = 0.0;
 HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
 
-// Relay Queue (тепер зберігає FullPacket)
+// Relay Queue
 struct RelayItem
 {
   FullPacket packet;
@@ -159,7 +162,6 @@ unsigned long lastBleRetryTime = 0;
 void sendGPSData();
 bool sendSafeLoRa(FullPacket &packet);
 void receiveLoRaMessage(int packetSize);
-// Оновлена функція сліпої ретрансляції (тепер передає час і прапори)
 void relayBlind(uint8_t ttl, uint32_t timestamp, uint8_t flags, uint8_t *iv, uint8_t *cipherData);
 void enqueueRelay(FullPacket &packet);
 void processRelayQueue();
@@ -177,9 +179,14 @@ void wakeLoRa();
 void processGPS(int maxBytes);
 void updateBLE(FullPacket &packet, bool isLocal);
 uint16_t calculateCRC(uint8_t *data, size_t len);
-
 void generateKeyFromPassword(const char *password);
 bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, uint8_t *iv);
+
+void loadSettings();
+void checkDoubleReset();
+void setupConfigMode();
+void handleRoot();
+void handleSave();
 
 // ==========================================
 // BLE CALLBACKS
@@ -199,6 +206,110 @@ class MyServerCallbacks : public BLEServerCallbacks
 };
 
 // ==========================================
+// CONFIGURATION LOGIC (WEB SERVER)
+// ==========================================
+
+void loadSettings()
+{
+  preferences.begin("lora_config", false);
+  settings_name = preferences.getString("dev_name", "Команда 1");
+  settings_password = preferences.getString("aes_pass", "SuperStrongPassword123");
+  preferences.end();
+  Serial.println("Loaded Settings Name: " + settings_name);
+}
+
+void checkDoubleReset()
+{
+  preferences.begin("boot_cnt", false);
+  bool resetFlag = preferences.getBool("reset_flag", false);
+
+  if (resetFlag)
+  {
+    isConfigMode = true;
+    preferences.putBool("reset_flag", false);
+    Serial.println(">>> DOUBLE RESET DETECTED! ENTERING CONFIG MODE <<<");
+  }
+  else
+  {
+    preferences.putBool("reset_flag", true);
+    Serial.println(">>> Boot flag set. <<<");
+  }
+  preferences.end();
+}
+
+void clearResetFlag()
+{
+  static unsigned long bootTime = millis();
+  static bool flagCleared = false;
+
+  if (!flagCleared && millis() - bootTime > 3000)
+  {
+    preferences.begin("boot_cnt", false);
+    preferences.putBool("reset_flag", false);
+    preferences.end();
+    flagCleared = true;
+    Serial.println(">>> Boot flag cleared. <<<");
+  }
+}
+
+void setupConfigMode()
+{
+  WiFi.mode(WIFI_AP);
+
+  // === ЗМІНА ТУТ: Формуємо ім'я таке ж, як у BLE ===
+  String apName = "GAMMA-" + String(DEVICE_ID_CONST);
+  WiFi.softAP(apName.c_str(), "");
+
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleRoot);
+  server.begin();
+
+  Serial.println("AP Started: " + apName);
+  Serial.println("Go to 192.168.4.1");
+}
+
+void handleRoot()
+{
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>LoRa Settings</title><style>body{font-family:sans-serif;padding:20px;background:#f0f0f0}input{display:block;width:100%;padding:10px;margin:10px 0;box-sizing:border-box}button{background:#007bff;color:white;padding:15px;border:none;width:100%;font-size:16px}</style></head><body>";
+  html += "<h2>Налаштування LoRa</h2>";
+  html += "<form action='/save' method='POST'>";
+  html += "<label>Ім'я пристрою (до 15 символів):</label>";
+  html += "<input type='text' name='devname' value='" + settings_name + "' maxlength='15'>";
+  html += "<label>Ключ шифрування:</label>";
+  html += "<input type='text' name='pass' value='" + settings_password + "'>";
+  html += "<button type='submit'>ЗБЕРЕГТИ І ПЕРЕЗАВАНТАЖИТИ</button>";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSave()
+{
+  if (server.hasArg("devname") && server.hasArg("pass"))
+  {
+    String newName = server.arg("devname");
+    String newPass = server.arg("pass");
+
+    if (newName.length() > 0 && newPass.length() > 0)
+    {
+      preferences.begin("lora_config", false);
+      preferences.putString("dev_name", newName);
+      preferences.putString("aes_pass", newPass);
+      preferences.end();
+
+      String html = "<html><body><h1>Збережено!</h1><p>Перезавантаження...</p></body></html>";
+      server.send(200, "text/html", html);
+      delay(1000);
+      ESP.restart();
+    }
+  }
+  server.send(400, "text/plain", "Error: Empty fields");
+}
+
+// ==========================================
 // SETUP
 // ==========================================
 void setup()
@@ -207,7 +318,17 @@ void setup()
   pinMode(BLE_SWITCH_PIN, INPUT_PULLUP);
   Serial.begin(115200);
 
-  generateKeyFromPassword(AES_PASSWORD);
+  checkDoubleReset();
+  loadSettings();
+
+  if (isConfigMode)
+  {
+    setupConfigMode();
+    return;
+  }
+
+  // === ЗВИЧАЙНИЙ РЕЖИМ ===
+  generateKeyFromPassword(settings_password.c_str());
   if (!isKeyInitialized)
   {
     Serial.println("CRITICAL: Key gen failed.");
@@ -231,6 +352,7 @@ void setup()
   LoRa.setTxPower(20);
   LoRa.enableCrc();
 
+  // BLE ініціалізація з тим самим іменем
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -252,7 +374,7 @@ void setup()
 }
 
 // ==========================================
-// CRYPTO
+// CRYPTO & HELPERS
 // ==========================================
 void generateKeyFromPassword(const char *password)
 {
@@ -289,6 +411,15 @@ bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, 
 // ==========================================
 void loop()
 {
+  if (isConfigMode)
+  {
+    dnsServer.processNextRequest();
+    server.handleClient();
+    delay(5);
+    return;
+  }
+
+  clearResetFlag();
   processGPS(64);
 
   bool activeWindow = true;
@@ -328,9 +459,7 @@ void loop()
     {
       receiveLoRaMessage(packetSize);
       if (millis() >= nextSendTime - 1000)
-      {
         nextSendTime = millis() + random(2000, 5000);
-      }
     }
     else
     {
@@ -386,14 +515,12 @@ void loop()
 }
 
 // ==========================================
-// RX / TX LOGIC (NEW: Time & Flags Public)
+// RX / TX / HELPERS (Code Identical to Previous)
 // ==========================================
 
 bool sendSafeLoRa(FullPacket &packet)
 {
-  // CRC рахуємо для тіла пакету
   packet.body.crc = calculateCRC((uint8_t *)&packet.body, ENCRYPTED_SIZE - sizeof(uint16_t));
-
   if (!isLoRaAwake)
     wakeLoRa();
   if (LoRa.parsePacket() > 0)
@@ -404,103 +531,76 @@ bool sendSafeLoRa(FullPacket &packet)
 
   uint8_t iv[IV_SIZE];
   uint8_t cipherBuffer[ENCRYPTED_SIZE];
-
   for (int i = 0; i < IV_SIZE; i++)
     iv[i] = (uint8_t)esp_random();
-
-  // Шифруємо тільки BODY
   if (!aesCtrEncryptDecrypt((uint8_t *)&packet.body, cipherBuffer, ENCRYPTED_SIZE, iv))
     return false;
 
   if (LoRa.beginPacket() == 0)
     return false;
-
-  // --- НОВА СТРУКТУРА: ВСІ МЕТАДАНІ ВІДКРИТІ ---
-  LoRa.write(MESH_SIGNATURE);                  // 1. Підпис
-  LoRa.write(packet.ttl);                      // 2. TTL
-  LoRa.write((uint8_t *)&packet.timestamp, 4); // 3. ЧАС (4 байти)
-  LoRa.write(packet.flags);                    // 4. ПРАПОРИ (1 байт)
-  LoRa.write(iv, IV_SIZE);                     // 5. IV
-  LoRa.write(cipherBuffer, ENCRYPTED_SIZE);    // 6. Дані
-
+  LoRa.write(MESH_SIGNATURE);
+  LoRa.write(packet.ttl);
+  LoRa.write((uint8_t *)&packet.timestamp, 4);
+  LoRa.write(packet.flags);
+  LoRa.write(iv, IV_SIZE);
+  LoRa.write(cipherBuffer, ENCRYPTED_SIZE);
   LoRa.endPacket();
   LoRa.receive();
   return true;
 }
 
-// Допоміжна функція для сліпої ретрансляції (зберігає час!)
 void relayBlind(uint8_t ttl, uint32_t timestamp, uint8_t flags, uint8_t *iv, uint8_t *cipherData)
 {
   delay(random(50, 150));
-  if (LoRa.parsePacket() == 0)
+  if (LoRa.parsePacket() == 0 && LoRa.beginPacket())
   {
-    if (LoRa.beginPacket())
-    {
-      LoRa.write(MESH_SIGNATURE);
-      LoRa.write(ttl - 1);
-      LoRa.write((uint8_t *)&timestamp, 4); // Пересилаємо той самий час
-      LoRa.write(flags);                    // Пересилаємо ті самі прапори
-      LoRa.write(iv, IV_SIZE);
-      LoRa.write(cipherData, ENCRYPTED_SIZE);
-      LoRa.endPacket();
-      LoRa.receive();
-      Serial.println(">>> Blind Relay (Unencrypted Header preserved)");
-    }
+    LoRa.write(MESH_SIGNATURE);
+    LoRa.write(ttl - 1);
+    LoRa.write((uint8_t *)&timestamp, 4);
+    LoRa.write(flags);
+    LoRa.write(iv, IV_SIZE);
+    LoRa.write(cipherData, ENCRYPTED_SIZE);
+    LoRa.endPacket();
+    LoRa.receive();
+    Serial.println(">>> Blind Relay");
   }
 }
 
 void receiveLoRaMessage(int packetSize)
 {
-  if (!isLoRaAwake || packetSize == 0)
-    return;
-
-  if (packetSize < RADIO_PACKET_SIZE)
+  if (!isLoRaAwake || packetSize < RADIO_PACKET_SIZE)
   {
-    while (LoRa.available())
-      LoRa.read();
+    if (packetSize > 0)
+      while (LoRa.available())
+        LoRa.read();
     return;
   }
-
-  // 1. Читаємо публічний заголовок
   uint8_t sig = LoRa.read();
   if (sig != MESH_SIGNATURE)
     return;
 
   uint8_t incomingTTL = LoRa.read();
-
   uint32_t incomingTimestamp;
   LoRa.readBytes((uint8_t *)&incomingTimestamp, 4);
-
   uint8_t incomingFlags = LoRa.read();
-
-  // === ВАЖЛИВО: СИНХРОНІЗАЦІЯ ЧАСУ ===
-  // Ми це робимо ДО розшифрування.
-  // Навіть якщо це чужий пакет, але час валідний, ми синхронізуємось.
   syncTimeFromMesh(incomingTimestamp, incomingFlags);
 
-  // 2. Читаємо дані для розшифровки
   uint8_t iv[IV_SIZE];
   uint8_t cipherBuffer[ENCRYPTED_SIZE];
   uint8_t plainBuffer[ENCRYPTED_SIZE];
-
   LoRa.readBytes(iv, IV_SIZE);
   LoRa.readBytes(cipherBuffer, ENCRYPTED_SIZE);
   while (LoRa.available())
-    LoRa.read(); // Clean buffer
+    LoRa.read();
 
-  // 3. Спроба розшифрувати
   aesCtrEncryptDecrypt(cipherBuffer, plainBuffer, ENCRYPTED_SIZE, iv);
-
-  // 4. Перевірка CRC
   LoRaBody tempBody;
   memcpy(&tempBody, plainBuffer, ENCRYPTED_SIZE);
-
   uint16_t receivedCRC = tempBody.crc;
   uint16_t calculatedCRC = calculateCRC((uint8_t *)&tempBody, ENCRYPTED_SIZE - sizeof(uint16_t));
 
   if (receivedCRC == calculatedCRC)
   {
-    // === НАШ ПАКЕТ ===
     FullPacket fullRx;
     fullRx.timestamp = incomingTimestamp;
     fullRx.flags = incomingFlags;
@@ -509,7 +609,6 @@ void receiveLoRaMessage(int packetSize)
 
     if (strncmp(fullRx.body.deviceId, DEVICE_ID_CONST, 8) == 0)
       return;
-
     if (isPacketUnique(fullRx))
     {
       updateBLE(fullRx, false);
@@ -521,48 +620,32 @@ void receiveLoRaMessage(int packetSize)
       }
     }
   }
-  else
+  else if (incomingTTL > 0)
   {
-    // === ЧУЖИЙ ПАКЕТ (але час ми вже використали!) ===
-    Serial.println("Foreign Packet (Time synced). Blind Relaying...");
-    if (incomingTTL > 0)
-    {
-      relayBlind(incomingTTL, incomingTimestamp, incomingFlags, iv, cipherBuffer);
-    }
+    relayBlind(incomingTTL, incomingTimestamp, incomingFlags, iv, cipherBuffer);
   }
 }
-
-// ==========================================
-// HELPERS
-// ==========================================
 
 void sendGPSData()
 {
   bool emergency = isSOS();
   if (!gps.location.isValid() && !emergency)
     return;
-
   FullPacket myPacket;
   float vbat = readBatteryVoltage();
-
-  // Заповнюємо публічні дані
   myPacket.ttl = DEFAULT_TTL;
   myPacket.flags = 0;
   time_t now;
   time(&now);
   myPacket.timestamp = (uint32_t)now;
-
-  // Заповнюємо приватні дані
   memset(myPacket.body.deviceId, 0, 8);
   strncpy(myPacket.body.deviceId, DEVICE_ID_CONST, 8);
   memset(myPacket.body.name, 0, 16);
-  strncpy(myPacket.body.name, DEVICE_NAME, 16);
-  myPacket.body.name[15] = '\0';
+  strncpy(myPacket.body.name, settings_name.c_str(), 16);
   myPacket.body.uid = esp_random();
   myPacket.body.type = emergency ? TYPE_SOS : TYPE_POS;
   myPacket.body.battery = calculateBatteryLevel(vbat);
   myPacket.body.voltage = (uint8_t)(vbat * 10);
-
   if (gps.location.isValid())
   {
     myPacket.body.lat = (int32_t)(gps.location.lat() * 10000000);
@@ -577,18 +660,14 @@ void sendGPSData()
     myPacket.body.lon = 0;
     myPacket.body.altitude = 0;
   }
-
   if (sendSafeLoRa(myPacket))
   {
     addHashToHistory(calculatePacketHash(myPacket));
     updateBLE(myPacket, true);
-    Serial.println("Packet sent (Time Public/Data Secure)");
+    Serial.println("Packet sent");
   }
   else
-  {
-    Serial.println("GPS Send skipped: Busy");
     nextSendTime += 1000;
-  }
 }
 
 void setupPowerSaving()
@@ -596,7 +675,6 @@ void setupPowerSaving()
   esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = true};
   esp_pm_configure(&pm_config);
 }
-
 uint16_t calculateCRC(uint8_t *data, size_t len)
 {
   uint16_t crc = 0;
@@ -604,16 +682,10 @@ uint16_t calculateCRC(uint8_t *data, size_t len)
   {
     crc ^= (uint16_t)data[i] << 8;
     for (uint8_t j = 0; j < 8; j++)
-    {
-      if (crc & 0x8000)
-        crc = (crc << 1) ^ 0x1021;
-      else
-        crc <<= 1;
-    }
+      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
   }
   return crc;
 }
-
 void processGPS(int maxBytes)
 {
   int bytesRead = 0;
@@ -625,7 +697,6 @@ void processGPS(int maxBytes)
   if (gps.time.isUpdated() && gps.time.isValid() && gps.date.isValid())
     syncWithGPS();
 }
-
 void syncWithGPS()
 {
   struct tm tm;
@@ -646,7 +717,6 @@ void syncWithGPS()
     lastGpsUpdateMs = millis();
   }
 }
-
 void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
 {
   if (!(remoteFlags & FLAG_GPS_VALID))
@@ -659,11 +729,9 @@ void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
     {
       struct timeval tv = {.tv_sec = (time_t)remoteTimestamp, .tv_usec = 0};
       settimeofday(&tv, NULL);
-      Serial.println("Synced time from MESH (Public Header)");
     }
   }
 }
-
 void sleepLoRa()
 {
   LoRa.sleep();
@@ -674,7 +742,6 @@ void wakeLoRa()
   LoRa.receive();
   isLoRaAwake = true;
 }
-
 void enqueueRelay(FullPacket &packet)
 {
   int nextHead = (queueHead + 1) % QUEUE_SIZE;
@@ -686,7 +753,6 @@ void enqueueRelay(FullPacket &packet)
   relayQueue[queueHead].retries = 0;
   queueHead = nextHead;
 }
-
 void processRelayQueue()
 {
   if (queueHead == queueTail)
@@ -698,7 +764,7 @@ void processRelayQueue()
     {
       item->active = false;
       queueTail = (queueTail + 1) % QUEUE_SIZE;
-      Serial.println("Relayed (My network).");
+      Serial.println("Relayed.");
     }
     else
     {
@@ -713,7 +779,6 @@ void processRelayQueue()
     }
   }
 }
-
 void updateBLE(FullPacket &packet, bool isLocal)
 {
   if (!bleEnabled || !deviceConnected)
@@ -722,7 +787,7 @@ void updateBLE(FullPacket &packet, bool isLocal)
   if (isLocal)
   {
     docDisplay["id"] = LOCAL_DISPLAY_ID;
-    docDisplay["name"] = DEVICE_NAME;
+    docDisplay["name"] = settings_name;
   }
   else
   {
@@ -749,7 +814,6 @@ void updateBLE(FullPacket &packet, bool isLocal)
   pCharacteristic->setValue(buffer);
   pCharacteristic->notify();
 }
-
 bool isPacketUnique(FullPacket &packet)
 {
   uint32_t msgHash = calculatePacketHash(packet);
@@ -773,7 +837,6 @@ uint32_t calculatePacketHash(FullPacket &packet)
   return hash;
 }
 bool isSOS() { return digitalRead(BTN) == LOW; }
-
 float readBatteryVoltage()
 {
   uint32_t adcSum = 0;
