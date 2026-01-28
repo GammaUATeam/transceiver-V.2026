@@ -87,7 +87,9 @@ struct FullPacket
 #define GPS_TX 4
 
 const char *DEVICE_ID_CONST = "bug1";
-#define LOCAL_DISPLAY_ID 500001
+// === ЗМІНА ТУТ: LOCAL_DISPLAY_ID тепер дорівнює DEVICE_ID_CONST ===
+#define LOCAL_DISPLAY_ID DEVICE_ID_CONST
+
 const unsigned long SEND_INTERVAL = 5000;
 #define DEFAULT_TTL 3
 #define baud_rate 9600 // Use 115200 for Foxeer, 9600 for BN180
