@@ -73,11 +73,18 @@ struct FullPacket
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
 // ==========================================
-// ПІНИ ТА НАЛАШТУВАННЯ
+// ПІНИ ТА НАЛАШТУВАННЯ (ЗМІНЕНО ПІД ВАШ ЗАПИТ)
 // ==========================================
-#define LORA_SS 10
-#define LORA_RST 9
-#define LORA_DIO0 2
+// SPI PINS
+#define LORA_SCK 18
+#define LORA_MISO 17
+#define LORA_MOSI 16
+
+// LORA CONTROL PINS
+#define LORA_SS 5    // Chip Select / NSS
+#define LORA_RST 14  // Reset
+#define LORA_DIO0 13 // IRQ / DIO0
+
 #define LORA_FREQ 433E6
 
 #define BTN 6
@@ -86,8 +93,7 @@ struct FullPacket
 #define GPS_RX 3
 #define GPS_TX 4
 
-const char *DEVICE_ID_CONST = "bug1";
-// === ЗМІНА ТУТ: LOCAL_DISPLAY_ID тепер дорівнює DEVICE_ID_CONST ===
+const char *DEVICE_ID_CONST = "500003";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 
 const unsigned long SEND_INTERVAL = 5000;
@@ -257,8 +263,6 @@ void clearResetFlag()
 void setupConfigMode()
 {
   WiFi.mode(WIFI_AP);
-
-  // === ЗМІНА ТУТ: Формуємо ім'я таке ж, як у BLE ===
   String apName = "GAMMA-" + String(DEVICE_ID_CONST);
   WiFi.softAP(apName.c_str(), "");
 
@@ -344,7 +348,13 @@ void setup()
   gpsSerial.setRxBufferSize(2048);
   gpsSerial.begin(baud_rate, SERIAL_8N1, GPS_RX, GPS_TX);
 
+  // === ВАЖЛИВА ЗМІНА: ЯВНА ІНІЦІАЛІЗАЦІЯ SPI ===
+  // Ініціалізуємо SPI з вашими конкретними пінами: SCK=18, MISO=17, MOSI=16, SS=5
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+
+  // Налаштовуємо піни керування модулем LoRa
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
   if (!LoRa.begin(LORA_FREQ))
   {
     Serial.println("LoRa failed!");
@@ -354,7 +364,6 @@ void setup()
   LoRa.setTxPower(20);
   LoRa.enableCrc();
 
-  // BLE ініціалізація з тим самим іменем
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -517,7 +526,7 @@ void loop()
 }
 
 // ==========================================
-// RX / TX / HELPERS (Code Identical to Previous)
+// RX / TX / HELPERS
 // ==========================================
 
 bool sendSafeLoRa(FullPacket &packet)
