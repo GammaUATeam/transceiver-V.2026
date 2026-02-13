@@ -13,6 +13,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_system.h"
+#include "driver/gpio.h" // Потрібно для налаштування пробудження по піну
 
 // +++ WIFI ТА НАЛАШТУВАННЯ +++
 #include <WiFi.h>
@@ -49,6 +50,13 @@
 #define BTN 0
 #define BLE_SWITCH_PIN 46
 #define BATTERY_ADC_PIN 1
+
+// ==========================================
+// НАЛАШТУВАННЯ СНУ
+// ==========================================
+#define STAY_AWAKE_MS 10000         // Скільки часу не спати після активності (10 сек)
+#define SLEEP_DURATION_MS 5000      // Як на довго засинати (5 сек), якщо нічого не відбувається
+unsigned long lastActivityTime = 0; // Час останньої події (RX, TX, Button)
 
 // ==========================================
 // ЗМІННІ НАЛАШТУВАНЬ
@@ -94,14 +102,10 @@ struct FullPacket
 #define IV_SIZE 16
 #define TOTAL_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
-const char *DEVICE_ID_CONST = "h2";
+const char *DEVICE_ID_CONST = "h1";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
-const unsigned long SEND_INTERVAL = 5000;
+const unsigned long SEND_INTERVAL = 15000; // Збільшив інтервал для економії
 #define DEFAULT_TTL 3
-
-const int RX_WINDOW_SECONDS = 25;
-const int TX_WINDOW_SECONDS = 20;
-const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 
 #define FLAG_GPS_VALID 0x01
 #define FLAG_RELAYED 0x02
@@ -109,14 +113,16 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 #define TYPE_SOS 1
 
 // --- GLOBALS ---
-int loopCounter = 0;
-bool isLongListenMode = false;
 float filteredBatteryVoltage = 0.0;
 
 // Hardware Objects
 SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
+
+// Interrupt Logic
+volatile bool operationDone = false;
+bool transmitFlag = false; // true if currently transmitting
 
 // Relay Queue
 struct RelayItem
@@ -135,9 +141,7 @@ int queueTail = 0;
 // JSON & Logic
 JsonDocument docDisplay;
 unsigned long nextSendTime = 0;
-bool isLoRaAwake = true;
 unsigned long lastGpsUpdateMs = 0;
-const unsigned long GPS_TIMEOUT_MS = 3600000;
 
 // Duplicate Filter
 #define MESSAGE_HISTORY_SIZE 50
@@ -148,20 +152,30 @@ int historyIndex = 0;
 BLECharacteristic *pCharacteristic;
 BLEServer *pServer;
 bool deviceConnected = false;
-bool oldDeviceConnected = false; // Важлива змінна для відстеження стану
+bool oldDeviceConnected = false;
 bool bleEnabled = false;
-unsigned long lastBleRetryTime = 0;
 
 #define SERVICE_UUID "a066b5b0-c522-4aa9-b148-8f24f37fcba6"
 #define CHARACTERISTIC_UUID "d792d09f-1d6e-422b-991a-e2933e7d848b"
 
+// ASYNC SEND VARIABLES
+uint8_t asyncTxBuffer[256];
+int asyncTxLen = 0;
+bool packetPending = false;
+unsigned long packetPendingSince = 0;
+unsigned long randomBackoff = 0;
+
 // ==========================================
 // ПРОТОТИПИ
 // ==========================================
-void sendGPSData();
-bool sendSafeLoRa(FullPacket &packet);
+void setFlag(void);
+void handleLoRaInterrupt();
+void trySendGPSData();
+void prepareAndSend(FullPacket &packet, bool isRelay);
+void checkSendQueue();
+void enterLightSleep();
+
 void receiveLoRaMessage();
-void relayBlind(uint8_t ttl, uint32_t timestamp, uint8_t flags, uint8_t *iv, uint8_t *cipherData);
 void enqueueRelay(FullPacket &packet);
 void processRelayQueue();
 bool isPacketUnique(FullPacket &packet);
@@ -172,9 +186,6 @@ void syncWithGPS();
 float readBatteryVoltage();
 int calculateBatteryLevel(float voltage);
 bool isSOS();
-void setupPowerSaving();
-void sleepLoRa();
-void wakeLoRa();
 void processGPS(int maxBytes);
 void updateBLE(FullPacket &packet, bool isLocal);
 uint16_t calculateCRC(uint8_t *data, size_t len);
@@ -185,6 +196,7 @@ void checkDoubleReset();
 void setupConfigMode();
 void handleRoot();
 void handleSave();
+void refreshActivity();
 
 // ==========================================
 // BLE CALLBACKS
@@ -194,12 +206,14 @@ class MyServerCallbacks : public BLEServerCallbacks
   void onConnect(BLEServer *pServer)
   {
     deviceConnected = true;
-    Serial.println("BLE Device Connected");
+    Serial.println("BLE Connected -> Sleep Disabled");
+    refreshActivity();
   };
   void onDisconnect(BLEServer *pServer)
   {
     deviceConnected = false;
-    Serial.println("BLE Device Disconnected");
+    Serial.println("BLE Disconnected");
+    refreshActivity();
   }
 };
 
@@ -252,8 +266,6 @@ void setupConfigMode()
   dnsServer.start(53, "*", WiFi.softAPIP());
 
   server.onNotFound(handleRoot);
-  server.on("/generate_204", handleRoot);
-  server.on("/fwlink", handleRoot);
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
@@ -261,14 +273,7 @@ void setupConfigMode()
 
 void handleRoot()
 {
-  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><title>LoRa Config</title>";
-  html += "<style>body{font-family:sans-serif;padding:20px;background:#eee}input,button{width:100%;padding:10px;margin:5px 0;box-sizing:border-box}button{background:#007bff;color:#fff;border:none}</style></head><body>";
-  html += "<h2>Налаштування Трекера</h2>";
-  html += "<form action='/save' method='POST'>";
-  html += "<label>Назва команди:</label><input name='devname' value='" + settings_name + "' maxlength='15'>";
-  html += "<label>Пароль шифрування:</label><input name='pass' value='" + settings_password + "'>";
-  html += "<button type='submit'>ЗБЕРЕГТИ І ПЕРЕЗАВАНТАЖИТИ</button>";
-  html += "</form></body></html>";
+  String html = "<!DOCTYPE html><html><body><h2>Config</h2><form action='/save' method='POST'><input name='devname' value='" + settings_name + "'><input name='pass' value='" + settings_password + "'><button type='submit'>SAVE</button></form></body></html>";
   server.send(200, "text/html", html);
 }
 
@@ -276,21 +281,25 @@ void handleSave()
 {
   if (server.hasArg("devname") && server.hasArg("pass"))
   {
-    String newName = server.arg("devname");
-    String newPass = server.arg("pass");
-    if (newName.length() > 0 && newPass.length() > 0)
-    {
-      preferences.begin("lora_config", false);
-      preferences.putString("dev_name", newName);
-      preferences.putString("aes_pass", newPass);
-      preferences.end();
-      String html = "<html><body><h1>Збережено!</h1><p>Перезавантаження...</p></body></html>";
-      server.send(200, "text/html", html);
-      delay(1000);
-      ESP.restart();
-    }
+    preferences.begin("lora_config", false);
+    preferences.putString("dev_name", server.arg("devname"));
+    preferences.putString("aes_pass", server.arg("pass"));
+    preferences.end();
+    server.send(200, "text/html", "Saved. Restarting...");
+    delay(1000);
+    ESP.restart();
   }
-  server.send(400, "text/plain", "Error: Empty fields");
+}
+
+// ==========================================
+// INTERRUPT FUNCTION
+// ==========================================
+#if defined(ESP8266) || defined(ESP32)
+ICACHE_RAM_ATTR
+#endif
+void setFlag(void)
+{
+  operationDone = true;
 }
 
 // ==========================================
@@ -301,7 +310,7 @@ void setup()
   Serial.begin(115200);
 
   pinMode(VEXT_PIN, OUTPUT);
-  digitalWrite(VEXT_PIN, HIGH);
+  digitalWrite(VEXT_PIN, HIGH); // GPS ON
   pinMode(ADC_CTRL_PIN, OUTPUT);
   digitalWrite(ADC_CTRL_PIN, LOW);
 
@@ -320,13 +329,13 @@ void setup()
   generateKeyFromPassword(settings_password.c_str());
 
   randomSeed(esp_random());
-  setupPowerSaving();
 
+  // GPS
   gpsSerial.setRxBufferSize(2048);
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
+  // LORA INIT
   SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN, RADIO_CS_PIN);
-
   int state = radio.begin(LORA_FREQ);
   if (state == RADIOLIB_ERR_NONE)
   {
@@ -346,6 +355,11 @@ void setup()
   radio.setCodingRate(5);
   radio.setCRC(true);
 
+  // *** ВАЖЛИВО ДЛЯ СНУ ***
+  // Налаштовуємо переривання, щоб LoRa могла розбудити ESP32
+  radio.setDio1Action(setFlag);
+
+  // BLE INIT
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -361,40 +375,11 @@ void setup()
   for (int i = 0; i < QUEUE_SIZE; i++)
     relayQueue[i].active = false;
 
-  wakeLoRa();
-  nextSendTime = millis() + random(2000, 10000);
-}
+  nextSendTime = millis() + random(2000, 5000);
+  refreshActivity(); // Ініціалізувати таймер активності
 
-// ==========================================
-// CRYPTO HELPERS
-// ==========================================
-void generateKeyFromPassword(const char *password)
-{
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, (const unsigned char *)password, strlen(password));
-  unsigned char hash[32];
-  mbedtls_sha256_finish(&ctx, hash);
-  mbedtls_sha256_free(&ctx);
-  memcpy(derivedKey, hash, 16);
-  isKeyInitialized = true;
-}
-
-bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, uint8_t *iv)
-{
-  if (!isKeyInitialized)
-    return false;
-  mbedtls_aes_context aes;
-  mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_enc(&aes, derivedKey, 128);
-  size_t nc_off = 0;
-  uint8_t stream_block[16];
-  uint8_t nonce_counter[16];
-  memcpy(nonce_counter, iv, 16);
-  int ret = mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce_counter, stream_block, input, output);
-  mbedtls_aes_free(&aes);
-  return (ret == 0);
+  // ПОЧИНАЄМО СЛУХАТИ
+  radio.startReceive();
 }
 
 // ==========================================
@@ -411,111 +396,142 @@ void loop()
   }
 
   clearResetFlag();
-  processGPS(64);
+  processGPS(32);
 
-  bool activeWindow = true;
-  bool txAllowed = true;
-  struct tm timeinfo;
-  static int lastMinute = -1;
+  // 1. ПЕРЕВІРКА КНОПКИ SOS (це активність)
+  if (digitalRead(BTN) == LOW)
+    refreshActivity();
 
-  if (getLocalTime(&timeinfo))
+  // 2. ОБРОБКА ПЕРЕРИВАНЬ LORA
+  if (operationDone)
   {
-    if (timeinfo.tm_min != lastMinute)
-    {
-      lastMinute = timeinfo.tm_min;
-      loopCounter++;
-      isLongListenMode = (loopCounter % LONG_LISTEN_INTERVAL_CYCLES == 0);
-    }
-    if (!isLongListenMode)
-    {
-      activeWindow = (timeinfo.tm_sec < RX_WINDOW_SECONDS);
-      txAllowed = (timeinfo.tm_sec < TX_WINDOW_SECONDS);
-    }
+    operationDone = false;
+    refreshActivity(); // Якщо щось прийшло або пішло - не спимо
+    handleLoRaInterrupt();
   }
 
-  if (activeWindow)
-  {
-    if (!isLoRaAwake)
-      wakeLoRa();
+  // 3. ОБРОБКА ЧЕРГИ НА ВІДПРАВКУ (CSMA/CA)
+  checkSendQueue();
 
-    receiveLoRaMessage();
-
-    if (txAllowed)
-    {
-      processRelayQueue();
-      if (millis() >= nextSendTime)
-      {
-        sendGPSData();
-        nextSendTime = millis() + SEND_INTERVAL + random(0, 3000);
-      }
-    }
-    delay(1);
-  }
-  else
+  // 4. ГЕНЕРАЦІЯ GPS (якщо час настав)
+  if (millis() >= nextSendTime && !packetPending)
   {
-    if (isLoRaAwake)
-      sleepLoRa();
-    processGPS(1024);
-    delay(100);
+    refreshActivity();
+    trySendGPSData();
   }
 
-  // === ЛОГІКА КЕРУВАННЯ BLE ===
+  // 5. ОБРОБКА RELAY
+  if (!packetPending)
+  {
+    processRelayQueue();
+  }
+
+  // === BLE LOGIC ===
   bool switchState = digitalRead(BLE_SWITCH_PIN);
-
-  // 1. Увімкнення/Вимкнення за перемикачем
   if (switchState == LOW && bleEnabled)
   {
     pServer->getAdvertising()->stop();
     bleEnabled = false;
     deviceConnected = false;
-    oldDeviceConnected = false; // Скидаємо стан
-    Serial.println("BLE Disabled by Switch");
+    refreshActivity();
   }
   else if (switchState == HIGH && !bleEnabled)
   {
     pServer->getAdvertising()->start();
     bleEnabled = true;
-    oldDeviceConnected = false;
-    Serial.println("BLE Enabled by Switch");
+    refreshActivity();
   }
 
-  // 2. АВТОМАТИЧНИЙ ПЕРЕЗАПУСК РЕКЛАМИ ПІСЛЯ ВІДКЛЮЧЕННЯ
   if (bleEnabled)
   {
-    // Якщо пристрій був підключений, але зараз відключився
     if (!deviceConnected && oldDeviceConnected)
     {
-      delay(500);                  // Даємо час стеку Bluetooth "одуматися"
-      pServer->startAdvertising(); // ПЕРЕЗАПУСКАЄМО РЕКЛАМУ
-      Serial.println("Restarting BLE Advertising...");
+      delay(500);
+      pServer->startAdvertising();
       oldDeviceConnected = deviceConnected;
     }
-
-    // Якщо пристрій підключився
     if (deviceConnected && !oldDeviceConnected)
     {
       oldDeviceConnected = deviceConnected;
     }
   }
+
+  // === ЛОГІКА СНУ ===
+  // Ми спимо, тільки якщо:
+  // 1. Немає активного з'єднання BLE (бо сон порве зв'язок)
+  // 2. Немає черги на відправку (packetPending == false)
+  // 3. Минуло достатньо часу з останньої активності (STAY_AWAKE_MS)
+  if (!deviceConnected && !packetPending && (millis() - lastActivityTime > STAY_AWAKE_MS))
+  {
+    enterLightSleep();
+  }
 }
 
 // ==========================================
-// RX / TX (ADAPTED FOR RADIOLIB)
+// SLEEP FUNCTION
+// ==========================================
+void refreshActivity()
+{
+  lastActivityTime = millis();
+}
+
+void enterLightSleep()
+{
+  // Налаштовуємо пробудження від таймера (щоб відправити GPS)
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MS * 1000ULL); // в мікросекундах
+
+  // Налаштовуємо пробудження від LoRa (Пін DIO1)
+  // Для ESP32-S3 (Heltec v3) використовуємо gpio_wakeup logic
+  gpio_wakeup_enable((gpio_num_t)RADIO_DIO1_PIN, GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  Serial.println(">>> Light Sleep...");
+  Serial.flush(); // Чекаємо поки все виведеться в консоль
+
+  // Входимо в Light Sleep (RAM зберігається, периферія працює частково)
+  esp_light_sleep_start();
+
+  // --- ТУТ ПРОГРАМА ПРОДОВЖУЄТЬСЯ ПІСЛЯ ПРОБУДЖЕННЯ ---
+  Serial.println(">>> Woke Up!");
+
+  // Після сну перевіряємо, хто нас розбудив
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO)
+  {
+    // Якщо розбудив LoRa радіомодуль, нам треба перевірити DIO1
+    // Але RadioLib interrupt flag міг не спрацювати коректно у сні,
+    // тому примусово ставимо прапорець, щоб loop() обробив пакет.
+    operationDone = true;
+  }
+
+  // Оновлюємо таймер активності, щоб одразу знову не заснути
+  refreshActivity();
+}
+
+// ==========================================
+// HANDLERS & HELPERS
 // ==========================================
 
-bool sendSafeLoRa(FullPacket &packet)
+void handleLoRaInterrupt()
 {
-  packet.body.crc = calculateCRC((uint8_t *)&packet.body, ENCRYPTED_SIZE - sizeof(uint16_t));
-
-  if (!isLoRaAwake)
-    wakeLoRa();
-
-  if (radio.scanChannel() == RADIOLIB_LORA_DETECTED)
+  if (transmitFlag)
   {
-    delay(random(100, 500));
-    if (radio.scanChannel() == RADIOLIB_LORA_DETECTED)
-      return false;
+    transmitFlag = false;
+    Serial.println("TX Complete");
+    radio.startReceive();
   }
+  else
+  {
+    receiveLoRaMessage();
+    radio.startReceive();
+  }
+}
+
+void prepareAndSend(FullPacket &packet, bool isRelay)
+{
+  refreshActivity(); // Не спати під час підготовки
+  packet.body.crc = calculateCRC((uint8_t *)&packet.body, ENCRYPTED_SIZE - sizeof(uint16_t));
 
   uint8_t iv[IV_SIZE];
   uint8_t cipherBuffer[ENCRYPTED_SIZE];
@@ -523,57 +539,55 @@ bool sendSafeLoRa(FullPacket &packet)
     iv[i] = (uint8_t)esp_random();
 
   if (!aesCtrEncryptDecrypt((uint8_t *)&packet.body, cipherBuffer, ENCRYPTED_SIZE, iv))
-    return false;
+    return;
 
-  uint8_t txBuffer[TOTAL_PACKET_SIZE];
   int idx = 0;
-  txBuffer[idx++] = MESH_SIGNATURE;
-  txBuffer[idx++] = packet.ttl;
-  memcpy(&txBuffer[idx], &packet.timestamp, 4);
+  asyncTxBuffer[idx++] = MESH_SIGNATURE;
+  asyncTxBuffer[idx++] = packet.ttl;
+  memcpy(&asyncTxBuffer[idx], &packet.timestamp, 4);
   idx += 4;
-  txBuffer[idx++] = packet.flags;
-  memcpy(&txBuffer[idx], iv, IV_SIZE);
+  asyncTxBuffer[idx++] = packet.flags;
+  memcpy(&asyncTxBuffer[idx], iv, IV_SIZE);
   idx += IV_SIZE;
-  memcpy(&txBuffer[idx], cipherBuffer, ENCRYPTED_SIZE);
+  memcpy(&asyncTxBuffer[idx], cipherBuffer, ENCRYPTED_SIZE);
   idx += ENCRYPTED_SIZE;
 
-  int state = radio.transmit(txBuffer, idx);
-  if (state == RADIOLIB_ERR_NONE)
-  {
-    radio.startReceive();
-    return true;
-  }
+  asyncTxLen = idx;
+  packetPending = true;
+  packetPendingSince = millis();
+  randomBackoff = random(50, 400);
 
-  radio.startReceive();
-  return false;
+  if (!isRelay)
+    nextSendTime = millis() + SEND_INTERVAL + random(0, 3000);
 }
 
-void relayBlind(uint8_t ttl, uint32_t timestamp, uint8_t flags, uint8_t *iv, uint8_t *cipherData)
+void checkSendQueue()
 {
-  delay(random(50, 150));
+  if (!packetPending)
+    return;
+  if (transmitFlag)
+    return;
 
-  uint8_t txBuffer[TOTAL_PACKET_SIZE];
-  int idx = 0;
-  txBuffer[idx++] = MESH_SIGNATURE;
-  txBuffer[idx++] = ttl - 1;
-  memcpy(&txBuffer[idx], &timestamp, 4);
-  idx += 4;
-  txBuffer[idx++] = flags;
-  memcpy(&txBuffer[idx], iv, IV_SIZE);
-  idx += IV_SIZE;
-  memcpy(&txBuffer[idx], cipherData, ENCRYPTED_SIZE);
-  idx += ENCRYPTED_SIZE;
-
-  radio.transmit(txBuffer, idx);
-  radio.startReceive();
-  Serial.println(">>> Blind Relay");
+  if (millis() - packetPendingSince > randomBackoff)
+  {
+    refreshActivity(); // Не спати під час відправки
+    int state = radio.startTransmit(asyncTxBuffer, asyncTxLen);
+    if (state == RADIOLIB_ERR_NONE)
+    {
+      transmitFlag = true;
+      packetPending = false;
+      Serial.println("TX Started");
+    }
+    else
+    {
+      packetPending = false;
+      radio.startReceive();
+    }
+  }
 }
 
 void receiveLoRaMessage()
 {
-  if (!isLoRaAwake)
-    return;
-
   size_t len = radio.getPacketLength();
   if (len == 0)
     return;
@@ -583,7 +597,6 @@ void receiveLoRaMessage()
 
   if (state != RADIOLIB_ERR_NONE)
     return;
-
   if (len < TOTAL_PACKET_SIZE)
     return;
 
@@ -628,7 +641,10 @@ void receiveLoRaMessage()
 
     if (isPacketUnique(fullRx))
     {
+      Serial.print("RX from: ");
+      Serial.println(fullRx.body.name);
       updateBLE(fullRx, false);
+
       if (incomingTTL > 0)
       {
         fullRx.ttl = incomingTTL - 1;
@@ -637,17 +653,16 @@ void receiveLoRaMessage()
       }
     }
   }
-  else if (incomingTTL > 0)
-  {
-    relayBlind(incomingTTL, incomingTimestamp, incomingFlags, iv, cipherBuffer);
-  }
 }
 
-void sendGPSData()
+void trySendGPSData()
 {
   bool emergency = isSOS();
   if (!gps.location.isValid() && !emergency)
+  {
+    nextSendTime = millis() + 5000;
     return;
+  }
 
   FullPacket myPacket;
   float vbat = readBatteryVoltage();
@@ -682,22 +697,155 @@ void sendGPSData()
     myPacket.body.altitude = 0;
   }
 
-  if (sendSafeLoRa(myPacket))
+  addHashToHistory(calculatePacketHash(myPacket));
+  updateBLE(myPacket, true);
+  prepareAndSend(myPacket, false);
+}
+
+void enqueueRelay(FullPacket &packet)
+{
+  refreshActivity();
+  int nextHead = (queueHead + 1) % QUEUE_SIZE;
+  if (nextHead == queueTail)
+    queueTail = (queueTail + 1) % QUEUE_SIZE;
+
+  relayQueue[queueHead].packet = packet;
+  relayQueue[queueHead].triggerTime = millis() + random(500, 2000);
+  relayQueue[queueHead].active = true;
+  relayQueue[queueHead].retries = 0;
+  queueHead = nextHead;
+}
+
+void processRelayQueue()
+{
+  if (queueHead == queueTail)
+    return;
+  RelayItem *item = &relayQueue[queueTail];
+  if (item->active && millis() >= item->triggerTime)
   {
-    addHashToHistory(calculatePacketHash(myPacket));
-    updateBLE(myPacket, true);
-    Serial.println("Packet sent");
-  }
-  else
-  {
-    nextSendTime += 1000;
+    refreshActivity();
+    prepareAndSend(item->packet, true);
+    item->active = false;
+    queueTail = (queueTail + 1) % QUEUE_SIZE;
   }
 }
 
-void setupPowerSaving()
+void updateBLE(FullPacket &packet, bool isLocal)
 {
-  esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 160, .min_freq_mhz = 80, .light_sleep_enable = false};
-  esp_pm_configure(&pm_config);
+  if (!bleEnabled)
+    return;
+
+  docDisplay.clear();
+  if (isLocal)
+  {
+    docDisplay["id"] = LOCAL_DISPLAY_ID;
+    docDisplay["name"] = settings_name;
+  }
+  else
+  {
+    char idBuf[9];
+    strncpy(idBuf, packet.body.deviceId, 8);
+    idBuf[8] = '\0';
+    docDisplay["id"] = idBuf;
+    docDisplay["name"] = packet.body.name;
+  }
+  docDisplay["t"] = packet.ttl;
+  docDisplay["type"] = (packet.body.type == TYPE_SOS) ? "SOS" : "POS";
+  docDisplay["bat"] = packet.body.battery;
+  docDisplay["v"] = (float)packet.body.voltage / 10.0;
+  if (packet.flags & FLAG_GPS_VALID)
+    docDisplay["gps_ok"] = 1;
+  if (packet.body.lat != 0)
+  {
+    docDisplay["lat"] = packet.body.lat;
+    docDisplay["lon"] = packet.body.lon;
+    docDisplay["alt"] = packet.body.altitude;
+  }
+
+  char buffer[512];
+  size_t len = serializeJson(docDisplay, buffer, sizeof(buffer));
+  pCharacteristic->setValue((uint8_t *)buffer, len);
+  if (deviceConnected)
+    pCharacteristic->notify();
+}
+
+void generateKeyFromPassword(const char *password)
+{
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char *)password, strlen(password));
+  unsigned char hash[32];
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+  memcpy(derivedKey, hash, 16);
+  isKeyInitialized = true;
+}
+
+bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, uint8_t *iv)
+{
+  if (!isKeyInitialized)
+    return false;
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, derivedKey, 128);
+  size_t nc_off = 0;
+  uint8_t stream_block[16];
+  uint8_t nonce_counter[16];
+  memcpy(nonce_counter, iv, 16);
+  int ret = mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce_counter, stream_block, input, output);
+  mbedtls_aes_free(&aes);
+  return (ret == 0);
+}
+
+bool isPacketUnique(FullPacket &packet)
+{
+  uint32_t msgHash = calculatePacketHash(packet);
+  for (int i = 0; i < MESSAGE_HISTORY_SIZE; i++)
+    if (messageHistory[i] == msgHash)
+      return false;
+  addHashToHistory(msgHash);
+  return true;
+}
+
+void addHashToHistory(uint32_t hash)
+{
+  messageHistory[historyIndex] = hash;
+  historyIndex = (historyIndex + 1) % MESSAGE_HISTORY_SIZE;
+}
+
+uint32_t calculatePacketHash(FullPacket &packet)
+{
+  uint32_t hash = 5381;
+  for (int i = 0; i < 8; i++)
+    hash = ((hash << 5) + hash) + packet.body.deviceId[i];
+  hash = ((hash << 5) + hash) + packet.body.uid;
+  return hash;
+}
+
+bool isSOS() { return digitalRead(BTN) == LOW; }
+
+float readBatteryVoltage()
+{
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  delayMicroseconds(100);
+  uint32_t adcSum = 0;
+  for (int i = 0; i < 5; i++)
+    adcSum += analogRead(BATTERY_ADC_PIN);
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+  float adcAverage = (float)adcSum / 5.0;
+  float rawVoltage = (adcAverage / 4095.0) * 3.3 * 4.9;
+  if (filteredBatteryVoltage == 0.0)
+    filteredBatteryVoltage = rawVoltage;
+  else
+    filteredBatteryVoltage = 0.1 * rawVoltage + 0.9 * filteredBatteryVoltage;
+  return filteredBatteryVoltage;
+}
+
+int calculateBatteryLevel(float voltage)
+{
+  float v = constrain(voltage, 3.2, 4.2);
+  return map(v * 100, 320, 420, 0, 100);
 }
 
 uint16_t calculateCRC(uint8_t *data, size_t len)
@@ -749,7 +897,7 @@ void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
 {
   if (!(remoteFlags & FLAG_GPS_VALID))
     return;
-  if (millis() - lastGpsUpdateMs > GPS_TIMEOUT_MS)
+  if (millis() - lastGpsUpdateMs > 3600000)
   {
     time_t now;
     time(&now);
@@ -759,144 +907,4 @@ void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
       settimeofday(&tv, NULL);
     }
   }
-}
-
-void sleepLoRa()
-{
-  radio.sleep();
-  isLoRaAwake = false;
-}
-void wakeLoRa()
-{
-  radio.startReceive();
-  isLoRaAwake = true;
-}
-
-void enqueueRelay(FullPacket &packet)
-{
-  int nextHead = (queueHead + 1) % QUEUE_SIZE;
-  if (nextHead == queueTail)
-    queueTail = (queueTail + 1) % QUEUE_SIZE;
-  relayQueue[queueHead].packet = packet;
-  relayQueue[queueHead].triggerTime = millis() + random(100, 1000);
-  relayQueue[queueHead].active = true;
-  relayQueue[queueHead].retries = 0;
-  queueHead = nextHead;
-}
-
-void processRelayQueue()
-{
-  if (queueHead == queueTail)
-    return;
-  RelayItem *item = &relayQueue[queueTail];
-  if (item->active && millis() >= item->triggerTime)
-  {
-    if (sendSafeLoRa(item->packet))
-    {
-      item->active = false;
-      queueTail = (queueTail + 1) % QUEUE_SIZE;
-      Serial.println("Relayed.");
-    }
-    else
-    {
-      item->retries++;
-      if (item->retries > MAX_RELAY_RETRIES)
-      {
-        item->active = false;
-        queueTail = (queueTail + 1) % QUEUE_SIZE;
-      }
-      else
-      {
-        item->triggerTime = millis() + random(1000, 3000);
-      }
-    }
-  }
-}
-
-void updateBLE(FullPacket &packet, bool isLocal)
-{
-  if (!bleEnabled || !deviceConnected)
-    return;
-  docDisplay.clear();
-  if (isLocal)
-  {
-    docDisplay["id"] = LOCAL_DISPLAY_ID;
-    docDisplay["name"] = settings_name;
-  }
-  else
-  {
-    char idBuf[9];
-    strncpy(idBuf, packet.body.deviceId, 8);
-    idBuf[8] = '\0';
-    docDisplay["id"] = idBuf;
-    docDisplay["name"] = packet.body.name;
-  }
-  docDisplay["t"] = packet.ttl;
-  docDisplay["type"] = (packet.body.type == TYPE_SOS) ? "SOS" : "POS";
-  docDisplay["bat"] = packet.body.battery;
-  docDisplay["v"] = (float)packet.body.voltage / 10.0;
-  if (packet.flags & FLAG_GPS_VALID)
-    docDisplay["gps_ok"] = 1;
-  if (packet.body.lat != 0)
-  {
-    docDisplay["lat"] = packet.body.lat;
-    docDisplay["lon"] = packet.body.lon;
-    docDisplay["alt"] = packet.body.altitude;
-  }
-  char buffer[512];
-  serializeJson(docDisplay, buffer, sizeof(buffer));
-  pCharacteristic->setValue(buffer);
-  pCharacteristic->notify();
-}
-
-bool isPacketUnique(FullPacket &packet)
-{
-  uint32_t msgHash = calculatePacketHash(packet);
-  for (int i = 0; i < MESSAGE_HISTORY_SIZE; i++)
-    if (messageHistory[i] == msgHash)
-      return false;
-  addHashToHistory(msgHash);
-  return true;
-}
-
-void addHashToHistory(uint32_t hash)
-{
-  messageHistory[historyIndex] = hash;
-  historyIndex = (historyIndex + 1) % MESSAGE_HISTORY_SIZE;
-}
-
-uint32_t calculatePacketHash(FullPacket &packet)
-{
-  uint32_t hash = 5381;
-  for (int i = 0; i < 8; i++)
-    hash = ((hash << 5) + hash) + packet.body.deviceId[i];
-  hash = ((hash << 5) + hash) + packet.body.uid;
-  return hash;
-}
-
-bool isSOS() { return digitalRead(BTN) == LOW; }
-
-float readBatteryVoltage()
-{
-  digitalWrite(ADC_CTRL_PIN, LOW);
-  delay(10);
-  uint32_t adcSum = 0;
-  for (int i = 0; i < 20; i++)
-    adcSum += analogRead(BATTERY_ADC_PIN);
-  digitalWrite(ADC_CTRL_PIN, HIGH);
-
-  float adcAverage = (float)adcSum / 20.0;
-  float rawVoltage = (adcAverage / 4095.0) * 3.3 * 4.9;
-
-  if (filteredBatteryVoltage == 0.0)
-    filteredBatteryVoltage = rawVoltage;
-  else
-    filteredBatteryVoltage = 0.1 * rawVoltage + 0.9 * filteredBatteryVoltage;
-  return filteredBatteryVoltage;
-}
-
-int calculateBatteryLevel(float voltage)
-{
-  float v = constrain(voltage, 3.2, 4.2);
-  return map(v * 100, 320, 420, 0, 100);
 }
