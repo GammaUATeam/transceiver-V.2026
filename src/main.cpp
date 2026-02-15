@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <RadioLib.h> // Замінено LoRa.h на RadioLib
+#include <RadioLib.h>
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
 #include <BLEDevice.h>
@@ -97,10 +97,9 @@ struct FullPacket
 #define IV_SIZE 16
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
-const char *DEVICE_ID_CONST = "h2";
+const char *DEVICE_ID_CONST = "h3";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 
-const unsigned long SEND_INTERVAL = 5000;
 #define DEFAULT_TTL 3
 #define baud_rate 115200 // UC6580 на Heltec працює на 115200
 
@@ -116,6 +115,9 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 // --- GLOBALS ---
 int loopCounter = 0;
 bool isLongListenMode = false;
+
+// Прапорець для контролю ОДНІЄЇ відправки на хвилину
+bool hasSentThisMinute = false;
 
 // Battery (Адаптовано під Heltec)
 const float ADC_FILTER_ALPHA = 0.1;
@@ -235,7 +237,6 @@ void loadSettings()
   settings_name = preferences.getString("dev_name", "Команда 1");
   settings_password = preferences.getString("aes_pass", "SuperStrongPassword123");
   preferences.end();
-  Serial.println("Loaded Settings Name: " + settings_name);
 }
 
 void checkDoubleReset()
@@ -247,12 +248,10 @@ void checkDoubleReset()
   {
     isConfigMode = true;
     preferences.putBool("reset_flag", false);
-    Serial.println(">>> DOUBLE RESET DETECTED! ENTERING CONFIG MODE <<<");
   }
   else
   {
     preferences.putBool("reset_flag", true);
-    Serial.println(">>> Boot flag set. <<<");
   }
   preferences.end();
 }
@@ -268,7 +267,6 @@ void clearResetFlag()
     preferences.putBool("reset_flag", false);
     preferences.end();
     flagCleared = true;
-    Serial.println(">>> Boot flag cleared. <<<");
   }
 }
 
@@ -362,11 +360,14 @@ void setup()
     while (1)
       delay(100);
   }
+
+  // +++ ОПТИМІЗОВАНІ ПАРАМЕТРИ ДЛЯ ШВИДКОСТІ (SF7) +++
   radio.setOutputPower(22);
-  radio.setSpreadingFactor(10);
+  radio.setSpreadingFactor(7); // Швидка передача
   radio.setBandwidth(125.0);
   radio.setCodingRate(5);
   radio.setCRC(true);
+  // ++++++++++++++++++++++++++++++++++++++++++++++++
 
   // Прикріплюємо переривання
   radio.setDio1Action(setFlag);
@@ -453,7 +454,12 @@ void loop()
       isLongListenMode = (loopCounter % LONG_LISTEN_INTERVAL_CYCLES == 0);
       if (isLongListenMode)
         Serial.println(">>> LONG LISTEN <<<");
+
+      // +++ НОВА ХВИЛИНА: ОНОВЛЮЄМО ПРАПОРЦІ І ТАЙМЕРИ +++
+      hasSentThisMinute = false;
+      nextSendTime = millis() + random(1000, 15000);
     }
+
     if (!isLongListenMode)
     {
       activeWindow = (timeinfo.tm_sec < RX_WINDOW_SECONDS);
@@ -475,19 +481,22 @@ void loop()
     {
       rxFlag = false;
       receiveLoRaMessage();
-      // Зсуваємо час наступної передачі, якщо отримали пакет
+
+      // Трохи зміщуємо наш таймер, щоб не накластися на відповідь іншого
       if (millis() >= nextSendTime - 1000)
-        nextSendTime = millis() + random(2000, 5000);
+        nextSendTime += random(500, 1500);
     }
     else
     {
       if (txAllowed)
       {
         processRelayQueue();
-        if (millis() >= nextSendTime)
+
+        // +++ ЛОГІКА ВІДПРАВКИ 1 РАЗ НА ХВИЛИНУ +++
+        if (millis() >= nextSendTime && !hasSentThisMinute)
         {
           sendGPSData();
-          nextSendTime = millis() + SEND_INTERVAL + random(0, 3000);
+          hasSentThisMinute = true;
         }
       }
     }
@@ -714,10 +723,6 @@ void sendGPSData()
     addHashToHistory(calculatePacketHash(myPacket));
     updateBLE(myPacket, true);
     Serial.println("Packet sent");
-  }
-  else
-  {
-    nextSendTime += 1000;
   }
 }
 
