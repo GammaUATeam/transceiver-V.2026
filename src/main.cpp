@@ -351,6 +351,14 @@ void setup()
     while (1)
       delay(100);
   }
+
+  // +++ СИНХРОНІЗАЦІЯ ПАРАМЕТРІВ З HELTEC (RadioLib) +++
+  LoRa.setSpreadingFactor(10);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+  // +++++++++++++++++++++++++++++++++++++++++++++++++++++
+
   LoRa.setTxPower(20);
   LoRa.enableCrc();
 
