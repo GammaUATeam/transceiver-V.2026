@@ -87,10 +87,8 @@ struct FullPacket
 #define GPS_TX 4
 
 const char *DEVICE_ID_CONST = "bug1";
-// === ЗМІНА ТУТ: LOCAL_DISPLAY_ID тепер дорівнює DEVICE_ID_CONST ===
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 
-const unsigned long SEND_INTERVAL = 5000;
 #define DEFAULT_TTL 3
 #define baud_rate 9600 // Use 115200 for Foxeer, 9600 for BN180
 
@@ -106,6 +104,9 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 // --- GLOBALS ---
 int loopCounter = 0;
 bool isLongListenMode = false;
+
+// Прапорець для контролю ОДНІЄЇ відправки на хвилину
+bool hasSentThisMinute = false;
 
 // Battery
 const float R1 = 100.0;
@@ -217,7 +218,6 @@ void loadSettings()
   settings_name = preferences.getString("dev_name", "Команда 1");
   settings_password = preferences.getString("aes_pass", "SuperStrongPassword123");
   preferences.end();
-  Serial.println("Loaded Settings Name: " + settings_name);
 }
 
 void checkDoubleReset()
@@ -229,12 +229,10 @@ void checkDoubleReset()
   {
     isConfigMode = true;
     preferences.putBool("reset_flag", false);
-    Serial.println(">>> DOUBLE RESET DETECTED! ENTERING CONFIG MODE <<<");
   }
   else
   {
     preferences.putBool("reset_flag", true);
-    Serial.println(">>> Boot flag set. <<<");
   }
   preferences.end();
 }
@@ -250,27 +248,21 @@ void clearResetFlag()
     preferences.putBool("reset_flag", false);
     preferences.end();
     flagCleared = true;
-    Serial.println(">>> Boot flag cleared. <<<");
   }
 }
 
 void setupConfigMode()
 {
   WiFi.mode(WIFI_AP);
-
-  // === ЗМІНА ТУТ: Формуємо ім'я таке ж, як у BLE ===
   String apName = "GAMMA-" + String(DEVICE_ID_CONST);
   WiFi.softAP(apName.c_str(), "");
-
   dnsServer.start(53, "*", WiFi.softAPIP());
 
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.onNotFound(handleRoot);
   server.begin();
-
   Serial.println("AP Started: " + apName);
-  Serial.println("Go to 192.168.4.1");
 }
 
 void handleRoot()
@@ -329,7 +321,6 @@ void setup()
     return;
   }
 
-  // === ЗВИЧАЙНИЙ РЕЖИМ ===
   generateKeyFromPassword(settings_password.c_str());
   if (!isKeyInitialized)
   {
@@ -352,17 +343,16 @@ void setup()
       delay(100);
   }
 
-  // +++ СИНХРОНІЗАЦІЯ ПАРАМЕТРІВ З HELTEC (RadioLib) +++
-  LoRa.setSpreadingFactor(7);
+  // +++ ОПТИМІЗОВАНІ ПАРАМЕТРИ ДЛЯ ШВИДКОСТІ (SF7) +++
+  LoRa.setSpreadingFactor(7); // SF7 (Пакет летить 70мс замість 400мс)
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
-  // +++++++++++++++++++++++++++++++++++++++++++++++++++++
+  // ++++++++++++++++++++++++++++++++++++++++++++++++
 
   LoRa.setTxPower(20);
   LoRa.enableCrc();
 
-  // BLE ініціалізація з тим самим іменем
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -397,7 +387,6 @@ void generateKeyFromPassword(const char *password)
   mbedtls_sha256_free(&ctx);
   memcpy(derivedKey, hash, 16);
   isKeyInitialized = true;
-  Serial.println("Key Init OK.");
 }
 
 bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, uint8_t *iv)
@@ -446,8 +435,12 @@ void loop()
       isLongListenMode = (loopCounter % LONG_LISTEN_INTERVAL_CYCLES == 0);
       if (isLongListenMode)
         Serial.println(">>> LONG LISTEN <<<");
-      nextSendTime = millis() + random(1000, 15000);
+
+      // +++ НОВА ХВИЛИНА: ОНОВЛЮЄМО ПРАПОРЦІ І ТАЙМЕРИ +++
+      hasSentThisMinute = false;                     // Дозволяємо відправку в цій хвилині
+      nextSendTime = millis() + random(1000, 15000); // Випадкова секунда (від 1-ї до 15-ї)
     }
+
     if (!isLongListenMode)
     {
       activeWindow = (timeinfo.tm_sec < RX_WINDOW_SECONDS);
@@ -469,18 +462,21 @@ void loop()
     if (packetSize > 0)
     {
       receiveLoRaMessage(packetSize);
+      // Якщо ми планували відправити прямо зараз, трохи відкладаємо, щоб не перебивати того, кого щойно почули
       if (millis() >= nextSendTime - 1000)
-        nextSendTime = millis() + random(2000, 5000);
+        nextSendTime += random(500, 1500);
     }
     else
     {
       if (txAllowed)
       {
         processRelayQueue();
-        if (millis() >= nextSendTime)
+
+        // +++ ЛОГІКА ВІДПРАВКИ 1 РАЗ НА ХВИЛИНУ +++
+        if (millis() >= nextSendTime && !hasSentThisMinute)
         {
           sendGPSData();
-          nextSendTime = millis() + SEND_INTERVAL + random(0, 3000);
+          hasSentThisMinute = true; // Ставимо мітку, що в цій хвилині ми вже відстрілялися!
         }
       }
     }
@@ -526,7 +522,7 @@ void loop()
 }
 
 // ==========================================
-// RX / TX / HELPERS (Code Identical to Previous)
+// RX / TX / HELPERS
 // ==========================================
 
 bool sendSafeLoRa(FullPacket &packet)
@@ -642,6 +638,7 @@ void sendGPSData()
   bool emergency = isSOS();
   if (!gps.location.isValid() && !emergency)
     return;
+
   FullPacket myPacket;
   float vbat = readBatteryVoltage();
   myPacket.ttl = DEFAULT_TTL;
@@ -649,14 +646,17 @@ void sendGPSData()
   time_t now;
   time(&now);
   myPacket.timestamp = (uint32_t)now;
+
   memset(myPacket.body.deviceId, 0, 8);
   strncpy(myPacket.body.deviceId, DEVICE_ID_CONST, 8);
   memset(myPacket.body.name, 0, 16);
   strncpy(myPacket.body.name, settings_name.c_str(), 16);
+
   myPacket.body.uid = esp_random();
   myPacket.body.type = emergency ? TYPE_SOS : TYPE_POS;
   myPacket.body.battery = calculateBatteryLevel(vbat);
   myPacket.body.voltage = (uint8_t)(vbat * 10);
+
   if (gps.location.isValid())
   {
     myPacket.body.lat = (int32_t)(gps.location.lat() * 10000000);
@@ -671,14 +671,13 @@ void sendGPSData()
     myPacket.body.lon = 0;
     myPacket.body.altitude = 0;
   }
+
   if (sendSafeLoRa(myPacket))
   {
     addHashToHistory(calculatePacketHash(myPacket));
     updateBLE(myPacket, true);
     Serial.println("Packet sent");
   }
-  else
-    nextSendTime += 1000;
 }
 
 void setupPowerSaving()
@@ -686,6 +685,7 @@ void setupPowerSaving()
   esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = true};
   esp_pm_configure(&pm_config);
 }
+
 uint16_t calculateCRC(uint8_t *data, size_t len)
 {
   uint16_t crc = 0;
@@ -697,6 +697,7 @@ uint16_t calculateCRC(uint8_t *data, size_t len)
   }
   return crc;
 }
+
 void processGPS(int maxBytes)
 {
   int bytesRead = 0;
@@ -708,6 +709,7 @@ void processGPS(int maxBytes)
   if (gps.time.isUpdated() && gps.time.isValid() && gps.date.isValid())
     syncWithGPS();
 }
+
 void syncWithGPS()
 {
   struct tm tm;
@@ -728,6 +730,7 @@ void syncWithGPS()
     lastGpsUpdateMs = millis();
   }
 }
+
 void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
 {
   if (!(remoteFlags & FLAG_GPS_VALID))
@@ -743,16 +746,19 @@ void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
     }
   }
 }
+
 void sleepLoRa()
 {
   LoRa.sleep();
   isLoRaAwake = false;
 }
+
 void wakeLoRa()
 {
   LoRa.receive();
   isLoRaAwake = true;
 }
+
 void enqueueRelay(FullPacket &packet)
 {
   int nextHead = (queueHead + 1) % QUEUE_SIZE;
@@ -764,6 +770,7 @@ void enqueueRelay(FullPacket &packet)
   relayQueue[queueHead].retries = 0;
   queueHead = nextHead;
 }
+
 void processRelayQueue()
 {
   if (queueHead == queueTail)
@@ -790,6 +797,7 @@ void processRelayQueue()
     }
   }
 }
+
 void updateBLE(FullPacket &packet, bool isLocal)
 {
   if (!bleEnabled || !deviceConnected)
@@ -825,6 +833,7 @@ void updateBLE(FullPacket &packet, bool isLocal)
   pCharacteristic->setValue(buffer);
   pCharacteristic->notify();
 }
+
 bool isPacketUnique(FullPacket &packet)
 {
   uint32_t msgHash = calculatePacketHash(packet);
@@ -834,11 +843,13 @@ bool isPacketUnique(FullPacket &packet)
   addHashToHistory(msgHash);
   return true;
 }
+
 void addHashToHistory(uint32_t hash)
 {
   messageHistory[historyIndex] = hash;
   historyIndex = (historyIndex + 1) % MESSAGE_HISTORY_SIZE;
 }
+
 uint32_t calculatePacketHash(FullPacket &packet)
 {
   uint32_t hash = 5381;
@@ -847,7 +858,9 @@ uint32_t calculatePacketHash(FullPacket &packet)
   hash = ((hash << 5) + hash) + packet.body.uid;
   return hash;
 }
+
 bool isSOS() { return digitalRead(BTN) == LOW; }
+
 float readBatteryVoltage()
 {
   uint32_t adcSum = 0;
@@ -862,6 +875,7 @@ float readBatteryVoltage()
     filteredBatteryVoltage = ADC_FILTER_ALPHA * rawVoltage + (1.0 - ADC_FILTER_ALPHA) * filteredBatteryVoltage;
   return filteredBatteryVoltage;
 }
+
 int calculateBatteryLevel(float voltage)
 {
   float v = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
