@@ -353,7 +353,7 @@ void setup()
   }
 
   // +++ СИНХРОНІЗАЦІЯ ПАРАМЕТРІВ З HELTEC (RadioLib) +++
-  LoRa.setSpreadingFactor(10);
+  LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
@@ -446,6 +446,7 @@ void loop()
       isLongListenMode = (loopCounter % LONG_LISTEN_INTERVAL_CYCLES == 0);
       if (isLongListenMode)
         Serial.println(">>> LONG LISTEN <<<");
+      nextSendTime = millis() + random(1000, 15000);
     }
     if (!isLongListenMode)
     {
