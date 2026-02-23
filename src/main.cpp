@@ -13,6 +13,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_system.h"
+#include "driver/gpio.h"
+#include "esp_timer.h" // Бібліотека для безпечного таймера в перериваннях
 
 // +++ ДОДАТКОВІ БІБЛІОТЕКИ ДЛЯ WIFI ТА НАЛАШТУВАНЬ +++
 #include <WiFi.h>
@@ -46,8 +48,11 @@
 #define GPS_TX 34
 
 #define BTN 0
-#define BLE_SWITCH_PIN 46
 #define BATTERY_ADC_PIN 1
+
+// ПЕРЕМИКАЧІ
+#define BLE_SWITCH_PIN 46
+#define SOS_SWITCH_PIN 47 // ПІН ДЛЯ ТУМБЛЕРА SOS
 
 // ==========================================
 // ЗМІННІ НАЛАШТУВАНЬ
@@ -55,7 +60,6 @@
 String settings_password = "SuperStrongPassword123";
 String settings_name = "Команда 1";
 
-// Об'єкти для збереження та веб-сервера
 Preferences preferences;
 WebServer server(80);
 DNSServer dnsServer;
@@ -92,7 +96,6 @@ struct FullPacket
   LoRaBody body;
 };
 
-// Розміри
 #define ENCRYPTED_SIZE sizeof(LoRaBody)
 #define IV_SIZE 16
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
@@ -101,7 +104,7 @@ const char *DEVICE_ID_CONST = "h3";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 
 #define DEFAULT_TTL 3
-#define baud_rate 115200 // UC6580 на Heltec працює на 115200
+#define baud_rate 115200
 
 const int RX_WINDOW_SECONDS = 25;
 const int TX_WINDOW_SECONDS = 20;
@@ -115,23 +118,21 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 // --- GLOBALS ---
 int loopCounter = 0;
 bool isLongListenMode = false;
-
-// Прапорець для контролю ОДНІЄЇ відправки на хвилину
 bool hasSentThisMinute = false;
 
-// Battery (Адаптовано під Heltec)
 const float ADC_FILTER_ALPHA = 0.1;
 const int ADC_SAMPLES = 20;
 const float BATTERY_MIN_VOLTAGE = 3.20;
 const float BATTERY_MAX_VOLTAGE = 4.20;
 float filteredBatteryVoltage = 0.0;
 
-// Hardware Objects
 HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
 SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 
-// LoRa Interrupt
+// ==========================================
+// ПЕРЕРИВАННЯ
+// ==========================================
 volatile bool rxFlag = false;
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
@@ -141,7 +142,29 @@ void setFlag(void)
   rxFlag = true;
 }
 
-// Relay Queue
+// +++ БЕЗПЕЧНЕ ПЕРЕРИВАННЯ КНОПКИ З АНТИБРЯЗКОТОМ +++
+volatile unsigned long isrLastTime = 0;
+volatile bool wifiBtnFlag = false;
+
+#if defined(ESP8266) || defined(ESP32)
+ICACHE_RAM_ATTR
+#endif
+void wifiBtnISR(void)
+{
+  // Отримуємо час у мілісекундах безпечним для переривань методом
+  unsigned long currentTime = (unsigned long)(esp_timer_get_time() / 1000ULL);
+
+  // Ігноруємо всі мікро-вібрації кнопки, які стаються швидше ніж за 400мс
+  if (currentTime - isrLastTime > 400)
+  {
+    wifiBtnFlag = true;
+    isrLastTime = currentTime;
+  }
+}
+
+// ==========================================
+// ЧЕРГА ТА ІНШІ ЗМІННІ
+// ==========================================
 struct RelayItem
 {
   FullPacket packet;
@@ -155,14 +178,12 @@ RelayItem relayQueue[QUEUE_SIZE];
 int queueHead = 0;
 int queueTail = 0;
 
-// JSON & Logic
 JsonDocument docDisplay;
 unsigned long nextSendTime = 0;
 bool isLoRaAwake = true;
 unsigned long lastGpsUpdateMs = 0;
 const unsigned long GPS_TIMEOUT_MS = 3600000;
 
-// Duplicate Filter
 #define MESSAGE_HISTORY_SIZE 50
 uint32_t messageHistory[MESSAGE_HISTORY_SIZE];
 int historyIndex = 0;
@@ -205,7 +226,6 @@ void generateKeyFromPassword(const char *password);
 bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, uint8_t *iv);
 
 void loadSettings();
-void checkDoubleReset();
 void setupConfigMode();
 void handleRoot();
 void handleSave();
@@ -230,44 +250,12 @@ class MyServerCallbacks : public BLEServerCallbacks
 // ==========================================
 // CONFIGURATION LOGIC (WEB SERVER)
 // ==========================================
-
 void loadSettings()
 {
   preferences.begin("lora_config", false);
   settings_name = preferences.getString("dev_name", "Команда 1");
   settings_password = preferences.getString("aes_pass", "SuperStrongPassword123");
   preferences.end();
-}
-
-void checkDoubleReset()
-{
-  preferences.begin("boot_cnt", false);
-  bool resetFlag = preferences.getBool("reset_flag", false);
-
-  if (resetFlag)
-  {
-    isConfigMode = true;
-    preferences.putBool("reset_flag", false);
-  }
-  else
-  {
-    preferences.putBool("reset_flag", true);
-  }
-  preferences.end();
-}
-
-void clearResetFlag()
-{
-  static unsigned long bootTime = millis();
-  static bool flagCleared = false;
-
-  if (!flagCleared && millis() - bootTime > 3000)
-  {
-    preferences.begin("boot_cnt", false);
-    preferences.putBool("reset_flag", false);
-    preferences.end();
-    flagCleared = true;
-  }
 }
 
 void setupConfigMode()
@@ -310,13 +298,18 @@ void handleSave()
       preferences.putString("dev_name", newName);
       preferences.putString("aes_pass", newPass);
       preferences.end();
+
       String html = "<html><body><h1>Збережено!</h1><p>Перезавантаження...</p></body></html>";
       server.send(200, "text/html", html);
       delay(1000);
+
       ESP.restart();
     }
   }
-  server.send(400, "text/plain", "Error: Empty fields");
+  else
+  {
+    server.send(400, "text/plain", "Error: Empty fields");
+  }
 }
 
 // ==========================================
@@ -326,7 +319,6 @@ void setup()
 {
   Serial.begin(115200);
 
-  // Живлення плати Heltec (ОБОВ'ЯЗКОВО ДЛЯ GPS)
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, HIGH);
   pinMode(ADC_CTRL_PIN, OUTPUT);
@@ -334,15 +326,15 @@ void setup()
 
   pinMode(BTN, INPUT_PULLUP);
   pinMode(BLE_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(SOS_SWITCH_PIN, INPUT_PULLUP);
 
-  checkDoubleReset();
   loadSettings();
 
-  if (isConfigMode)
-  {
-    setupConfigMode();
-    return;
-  }
+  // Прив'язуємо переривання та налаштовуємо пробудження
+  attachInterrupt(digitalPinToInterrupt(BTN), wifiBtnISR, FALLING);
+  gpio_wakeup_enable((gpio_num_t)BTN, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)SOS_SWITCH_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
 
   generateKeyFromPassword(settings_password.c_str());
   randomSeed(esp_random());
@@ -351,7 +343,6 @@ void setup()
   gpsSerial.setRxBufferSize(2048);
   gpsSerial.begin(baud_rate, SERIAL_8N1, GPS_RX, GPS_TX);
 
-  // Ініціалізація RadioLib SX1262
   SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN, RADIO_CS_PIN);
   int state = radio.begin(LORA_FREQ);
   if (state != RADIOLIB_ERR_NONE)
@@ -361,15 +352,12 @@ void setup()
       delay(100);
   }
 
-  // +++ ОПТИМІЗОВАНІ ПАРАМЕТРИ ДЛЯ ШВИДКОСТІ (SF7) +++
   radio.setOutputPower(22);
-  radio.setSpreadingFactor(7); // Швидка передача
+  radio.setSpreadingFactor(7);
   radio.setBandwidth(125.0);
   radio.setCodingRate(5);
   radio.setCRC(true);
-  // ++++++++++++++++++++++++++++++++++++++++++++++++
 
-  // Прикріплюємо переривання
   radio.setDio1Action(setFlag);
 
   // BLE
@@ -429,15 +417,64 @@ bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, 
 // ==========================================
 void loop()
 {
+  // +++ ЛОГІКА АКТИВАЦІЇ WIFI +++
+  if (wifiBtnFlag)
+  {
+    wifiBtnFlag = false;
+
+    if (!isConfigMode)
+    {
+      Serial.println("Кнопка натиснута. Перехід у WiFi AP...");
+
+      // 1. Жорстко блокуємо сон, щоб WiFi не відвалився
+      esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = false};
+      esp_pm_configure(&pm_config);
+
+      // 2. Вбиваємо BLE, щоб розвантажити антену для WiFi
+      if (bleEnabled)
+      {
+        pServer->getAdvertising()->stop();
+        BLEDevice::deinit(false);
+        bleEnabled = false;
+      }
+
+      // Перезапускаємо радіочіп WiFi
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(100);
+
+      isConfigMode = true;
+      setupConfigMode();
+    }
+    else
+    {
+      // Якщо WiFi ВЖЕ працює, друге натискання кнопки вимикає його
+      Serial.println("Вихід з режиму налаштувань. Перезавантаження...");
+      delay(100);
+      ESP.restart(); // Ідеальний та чистий метод повернення в робочий режим
+    }
+  }
+
   if (isConfigMode)
   {
     dnsServer.processNextRequest();
     server.handleClient();
     delay(5);
-    return;
+    return; // Блокуємо решту коду, поки ми в налаштуваннях
   }
 
-  clearResetFlag();
+  // +++ ЛОГІКА МИТТЄВОГО ВІДПРАВЛЕННЯ SOS +++
+  static bool lastSosState = HIGH;
+  bool currentSosState = digitalRead(SOS_SWITCH_PIN);
+
+  if (currentSosState == LOW && lastSosState == HIGH)
+  {
+    Serial.println("!!! SOS АКТИВОВАНО - МИТТЄВА ВІДПРАВКА !!!");
+    hasSentThisMinute = false;
+    nextSendTime = millis();
+  }
+  lastSosState = currentSosState;
+
   processGPS(64);
 
   bool activeWindow = true;
@@ -455,7 +492,6 @@ void loop()
       if (isLongListenMode)
         Serial.println(">>> LONG LISTEN <<<");
 
-      // +++ НОВА ХВИЛИНА: ОНОВЛЮЄМО ПРАПОРЦІ І ТАЙМЕРИ +++
       hasSentThisMinute = false;
       nextSendTime = millis() + random(1000, 15000);
     }
@@ -482,7 +518,6 @@ void loop()
       rxFlag = false;
       receiveLoRaMessage();
 
-      // Трохи зміщуємо наш таймер, щоб не накластися на відповідь іншого
       if (millis() >= nextSendTime - 1000)
         nextSendTime += random(500, 1500);
     }
@@ -492,11 +527,17 @@ void loop()
       {
         processRelayQueue();
 
-        // +++ ЛОГІКА ВІДПРАВКИ 1 РАЗ НА ХВИЛИНУ +++
         if (millis() >= nextSendTime && !hasSentThisMinute)
         {
           sendGPSData();
-          hasSentThisMinute = true;
+          if (!isSOS())
+          {
+            hasSentThisMinute = true;
+          }
+          else
+          {
+            nextSendTime = millis() + 10000; // Повторюємо SOS кожні 10 сек
+          }
         }
       }
     }
@@ -542,7 +583,7 @@ void loop()
 }
 
 // ==========================================
-// RX / TX / HELPERS (RadioLib Adaptation)
+// RX / TX / HELPERS
 // ==========================================
 
 bool sendSafeLoRa(FullPacket &packet)
@@ -551,7 +592,6 @@ bool sendSafeLoRa(FullPacket &packet)
   if (!isLoRaAwake)
     wakeLoRa();
 
-  // Listen Before Talk
   int cad = radio.scanChannel();
   if (cad == RADIOLIB_LORA_DETECTED || cad == RADIOLIB_PREAMBLE_DETECTED)
   {
@@ -579,7 +619,7 @@ bool sendSafeLoRa(FullPacket &packet)
   idx += ENCRYPTED_SIZE;
 
   int state = radio.transmit(txBuffer, idx);
-  radio.startReceive(); // Завжди повертаємося в RX
+  radio.startReceive();
   return (state == RADIOLIB_ERR_NONE);
 }
 
@@ -905,20 +945,22 @@ uint32_t calculatePacketHash(FullPacket &packet)
   return hash;
 }
 
-bool isSOS() { return digitalRead(BTN) == LOW; }
+bool isSOS()
+{
+  return digitalRead(SOS_SWITCH_PIN) == LOW;
+}
 
-// --- ЗМІНЕНО: Точна формула для Heltec Battery ---
 float readBatteryVoltage()
 {
-  digitalWrite(ADC_CTRL_PIN, LOW); // Вмикаємо дільник
+  digitalWrite(ADC_CTRL_PIN, LOW);
   delayMicroseconds(100);
   uint32_t adcSum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++)
     adcSum += analogRead(BATTERY_ADC_PIN);
-  digitalWrite(ADC_CTRL_PIN, HIGH); // Вимикаємо для економії
+  digitalWrite(ADC_CTRL_PIN, HIGH);
 
   float adcAverage = (float)adcSum / (float)ADC_SAMPLES;
-  float rawVoltage = (adcAverage / 4095.0) * 3.3 * 4.9; // Формула Heltec
+  float rawVoltage = (adcAverage / 4095.0) * 3.3 * 4.9;
 
   if (filteredBatteryVoltage == 0.0)
     filteredBatteryVoltage = rawVoltage;
