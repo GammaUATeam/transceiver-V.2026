@@ -68,7 +68,7 @@
 #define TFT_RST 39
 #define TFT_BL 21
 
-// +++ ЗМІНЕНО: Апаратний SPI для дисплею +++
+// +++ Апаратний SPI для дисплею +++
 SPIClass tftSPI(HSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 
@@ -77,6 +77,45 @@ GFXcanvas16 canvas(160, 80);
 
 // ОБ'ЄКТ ДЛЯ КИРИЛИЦІ
 U8G2_FOR_ADAFRUIT_GFX u8g2ForCanvas;
+
+// ==========================================
+// ГЛОБАЛЬНІ КОЛЬОРИ (BGR ФОРМАТ)
+// ==========================================
+const uint16_t COLOR_GREEN = 0x07E0;
+const uint16_t COLOR_YELLOW = 0x07FF;
+const uint16_t COLOR_RED = 0x001F;
+const uint16_t COLOR_BLUE = 0xF800;
+
+// ==========================================
+// ЗМІННІ ДЛЯ ПОПАПІВ (FULLSCREEN ПОВІДОМЛЕННЯ)
+// ==========================================
+volatile unsigned long popupTimer = 0;
+volatile bool showPopup = false;
+char popupText[20] = "";
+uint16_t popupColor = ST77XX_WHITE;
+
+// Змінні дисплею
+volatile bool displayActive = false;
+volatile unsigned long displayTimer = 0;
+volatile unsigned long lastDisplayBtnTime = 0;
+volatile bool forceImmediateUpdate = false;
+volatile uint8_t currentPage = 0;
+#define TOTAL_PAGES 3
+
+// Функція виклику повідомлення на весь екран
+void triggerPopup(const char *text, uint16_t color)
+{
+  strncpy(popupText, text, sizeof(popupText) - 1);
+  popupText[sizeof(popupText) - 1] = '\0';
+  popupColor = color;
+  popupTimer = millis();
+  showPopup = true;
+
+  // Примусово будимо екран
+  displayActive = true;
+  displayTimer = millis();
+  forceImmediateUpdate = true;
+}
 
 // ==========================================
 // ЗМІННІ НАЛАШТУВАНЬ ТА ГЛОБАЛЬНІ
@@ -125,7 +164,6 @@ struct FullPacket
 
 const char *DEVICE_ID_CONST = "h3";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
-
 #define DEFAULT_TTL 3
 #define baud_rate 115200
 
@@ -153,17 +191,6 @@ HardwareSerial gpsSerial(1);
 TinyGPSPlus gps;
 SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 
-// ==========================================
-// ЗМІННІ ДИСПЛЕЮ (FreeRTOS Core 0)
-// ==========================================
-volatile bool displayActive = false;
-volatile unsigned long displayTimer = 0;
-volatile unsigned long lastDisplayBtnTime = 0;
-volatile bool forceImmediateUpdate = false;
-
-volatile uint8_t currentPage = 0;
-#define TOTAL_PAGES 3
-
 TaskHandle_t DisplayTaskHandle;
 esp_pm_lock_handle_t display_pm_lock;
 
@@ -174,10 +201,7 @@ volatile bool rxFlag = false;
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
 #endif
-void setFlag(void)
-{
-  rxFlag = true;
-}
+void setFlag(void) { rxFlag = true; }
 
 volatile unsigned long isrLastTime = 0;
 volatile bool wifiBtnFlag = false;
@@ -219,6 +243,15 @@ void displayBtnISR()
   }
 }
 
+// Порожнє переривання для безпечного пробудження зі сну
+#if defined(ESP8266) || defined(ESP32)
+ICACHE_RAM_ATTR
+#endif
+void dummyWakeupISR(void)
+{
+  // Нічого не робимо. Сам факт переривання розбудить процесор.
+}
+
 // ==========================================
 // ЧЕРГА ТА ІНШІ ЗМІННІ
 // ==========================================
@@ -255,9 +288,7 @@ unsigned long lastBleRetryTime = 0;
 #define SERVICE_UUID "a066b5b0-c522-4aa9-b148-8f24f37fcba6"
 #define CHARACTERISTIC_UUID "d792d09f-1d6e-422b-991a-e2933e7d848b"
 
-// ==========================================
-// ПРОТОТИПИ
-// ==========================================
+// Прототипи
 void sendGPSData();
 bool sendSafeLoRa(FullPacket &packet);
 void receiveLoRaMessage();
@@ -299,9 +330,6 @@ class MyServerCallbacks : public BLEServerCallbacks
   }
 };
 
-// ==========================================
-// CONFIGURATION LOGIC (WEB SERVER)
-// ==========================================
 void loadSettings()
 {
   preferences.begin("lora_config", false);
@@ -345,9 +373,19 @@ void handleSave()
       preferences.putString("dev_name", newName);
       preferences.putString("aes_pass", newPass);
       preferences.end();
+
       String html = "<html><body><h1>Збережено!</h1><p>Перезавантаження...</p></body></html>";
       server.send(200, "text/html", html);
-      delay(1000);
+      delay(100);
+
+      triggerPopup("REBOOT", COLOR_RED);
+      delay(3000);
+
+      showPopup = false;
+      displayActive = false;
+      delay(200);
+      radio.sleep();
+
       ESP.restart();
     }
   }
@@ -365,25 +403,15 @@ void displayTask(void *pvParameters)
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, LOW);
 
-  // +++ ЗМІНЕНО: Ініціалізація апаратної шини SPI +++
   tftSPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-
-  // +++ ХИТРИЙ ТРЮК ДЛЯ ЗНИЩЕННЯ АПАРАТНОГО ШУМУ +++
-  // 1. Ініціалізуємо як повнорозмірну матрицю (128x160)
   tft.initR(INITR_BLACKTAB);
-  // 2. Очищаємо ВСЮ фізичну пам'ять контролера
   tft.fillScreen(ST77XX_BLACK);
-
-  // 3. Тепер ініціалізуємо як наш обрізаний екран (80x160)
   tft.initR(INITR_MINI160x80);
   tft.setRotation(3);
-  tft.invertDisplay(true); // Робимо фон по-справжньому чорним
-  // Оскільки ми вже все залили чорним, кольорова смужка зникне!
-  // ++++++++++++++++++++++++++++++++++++++++++++++++
+  tft.invertDisplay(true);
 
-  // Ініціалізація розширення для Кирилиці
   u8g2ForCanvas.begin(canvas);
-  u8g2ForCanvas.setFontMode(1); // Прозорий фон
+  u8g2ForCanvas.setFontMode(1);
   u8g2ForCanvas.setFontDirection(0);
 
   bool wasActive = false;
@@ -400,8 +428,43 @@ void displayTask(void *pvParameters)
 
       unsigned long currentMillis = millis();
 
-      // Час роботи екрану - 10 секунд
-      if (currentMillis - displayTimer <= 10000)
+      if (showPopup)
+      {
+        if (currentMillis - popupTimer <= 3000)
+        {
+          static unsigned long lastPopupUpdate = 0;
+          if (forceImmediateUpdate || currentMillis - lastPopupUpdate > 200)
+          {
+            forceImmediateUpdate = false;
+            lastPopupUpdate = currentMillis;
+
+            canvas.fillScreen(ST77XX_BLACK);
+            canvas.setTextWrap(false);
+
+            canvas.setTextSize(3);
+            canvas.setTextColor(popupColor);
+
+            int len = strlen(popupText);
+            int pxWidth = len * 18;
+            int x = (160 - pxWidth) / 2;
+            int y = (80 - 24) / 2;
+
+            canvas.setCursor(x > 0 ? x : 0, y);
+            canvas.print(popupText);
+
+            tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 160, 80);
+            if (digitalRead(TFT_BL) == LOW)
+              digitalWrite(TFT_BL, HIGH);
+          }
+        }
+        else
+        {
+          showPopup = false;
+          forceImmediateUpdate = true;
+          displayTimer = currentMillis;
+        }
+      }
+      else if (currentMillis - displayTimer <= 10000)
       {
         static unsigned long lastUpdate = 0;
 
@@ -410,27 +473,41 @@ void displayTask(void *pvParameters)
           forceImmediateUpdate = false;
           lastUpdate = currentMillis;
 
-          // 1. ОЧИЩАЄМО ВІРТУАЛЬНИЙ ЕКРАН
           canvas.fillScreen(ST77XX_BLACK);
           canvas.setTextWrap(false);
 
-          // --- 2. ВЕРХНЯ ПАНЕЛЬ ---
           canvas.setTextSize(1);
-          canvas.setTextColor(ST77XX_WHITE);
           canvas.setCursor(2, 2);
-          canvas.print("GAMMA");
+
+          if (isSOS())
+          {
+            canvas.setTextColor(COLOR_RED);
+            canvas.print("! SOS !");
+          }
+          else
+          {
+            canvas.setTextColor(ST77XX_WHITE);
+            canvas.printf("%s", DEVICE_ID_CONST);
+          }
 
           char timeStr[10] = "--:--";
           struct tm timeinfo;
-          // +++ ЗМІНЕНО: Додано параметр тайм-ауту 0, щоб уникнути затримок +++
           if (getLocalTime(&timeinfo, 0))
           {
             sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
           }
+          canvas.setTextColor(ST77XX_WHITE);
           canvas.setCursor(65, 2);
           canvas.print(timeStr);
 
           int batPct = calculateBatteryLevel(filteredBatteryVoltage);
+          uint16_t batColor = COLOR_GREEN;
+          if (batPct <= 20)
+            batColor = COLOR_RED;
+          else if (batPct <= 50)
+            batColor = COLOR_YELLOW;
+
+          canvas.setTextColor(batColor);
           if (batPct == 100)
             canvas.setCursor(110, 2);
           else if (batPct >= 10)
@@ -439,13 +516,13 @@ void displayTask(void *pvParameters)
             canvas.setCursor(122, 2);
           canvas.printf("%d%%", batPct);
 
-          canvas.drawRect(138, 1, 18, 9, ST77XX_WHITE);
-          canvas.fillRect(156, 3, 2, 5, ST77XX_WHITE);
+          canvas.drawRect(138, 1, 18, 9, batColor);
+          canvas.fillRect(156, 3, 2, 5, batColor);
           int batW = map(batPct, 0, 100, 0, 14);
-          canvas.fillRect(140, 3, batW, 5, ST77XX_WHITE);
+          canvas.fillRect(140, 3, batW, 5, batColor);
+
           canvas.drawFastHLine(0, 12, 160, ST77XX_WHITE);
 
-          // --- 3. ОСНОВНИЙ КОНТЕНТ ---
           int y = 18;
 
           if (currentPage == 0)
@@ -454,12 +531,15 @@ void displayTask(void *pvParameters)
             canvas.setCursor(2, y);
             if (gps.satellites.isValid() && gps.satellites.value() > 0)
             {
+              canvas.setTextColor(COLOR_GREEN);
               canvas.printf("GPS Lock: %d Sats", gps.satellites.value());
             }
             else
             {
+              canvas.setTextColor(COLOR_YELLOW);
               canvas.print("GPS: Searching...");
             }
+            canvas.setTextColor(ST77XX_WHITE);
 
             y += 14;
             canvas.setTextSize(2);
@@ -472,19 +552,17 @@ void displayTask(void *pvParameters)
           }
           else if (currentPage == 1)
           {
-            // ВИВІД КИРИЛИЦІ ЧЕРЕЗ U8G2
-            u8g2ForCanvas.setFont(u8g2_font_6x13_t_cyrillic); // Використовуємо правильний існуючий шрифт
+            u8g2ForCanvas.setFont(u8g2_font_6x13_t_cyrillic);
             u8g2ForCanvas.setForegroundColor(ST77XX_WHITE);
-            // У U8g2 координата Y вказує на низ шрифту (baseline), тому додаємо +11
             u8g2ForCanvas.setCursor(2, y + 11);
             u8g2ForCanvas.print("Node: ");
             u8g2ForCanvas.print(settings_name);
 
             y += 14;
-            // Повертаємось до стандартного шрифту для решти
             canvas.setTextSize(1);
+            canvas.setTextColor(ST77XX_WHITE);
             canvas.setCursor(2, y);
-            canvas.printf("ID:   %s", DEVICE_ID_CONST);
+            canvas.printf("Device: GAMMA-%s", DEVICE_ID_CONST);
 
             y += 14;
             canvas.setCursor(2, y);
@@ -497,6 +575,7 @@ void displayTask(void *pvParameters)
           else if (currentPage == 2)
           {
             canvas.setTextSize(1);
+            canvas.setTextColor(ST77XX_WHITE);
             canvas.setCursor(2, y);
             canvas.print("Encryption Key:");
 
@@ -516,14 +595,15 @@ void displayTask(void *pvParameters)
 
             y += 14;
             canvas.setCursor(2, y);
+
             if (isSOS())
             {
-              canvas.setTextColor(ST77XX_RED);
+              canvas.setTextColor(COLOR_RED);
               canvas.print("   !!! SOS ACTIVE !!!   ");
             }
             else
             {
-              canvas.setTextColor(ST77XX_WHITE);
+              canvas.setTextColor(COLOR_GREEN);
               canvas.print("   Status: Normal       ");
             }
           }
@@ -537,10 +617,8 @@ void displayTask(void *pvParameters)
               canvas.drawCircle(dotX + (i * 8), 76, 2, ST77XX_WHITE);
           }
 
-          // 4. ВІДПРАВЛЯЄМО ДАНІ НА ЕКРАН
           tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 160, 80);
 
-          // 5. ВМИКАЄМО ПІДСВІТКУ (тільки після відмальовки)
           if (digitalRead(TFT_BL) == LOW)
           {
             digitalWrite(TFT_BL, HIGH);
@@ -562,7 +640,15 @@ void displayTask(void *pvParameters)
         wasActive = false;
       }
     }
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    // Якщо дисплей активний або показуємо попап, оновлюємо частіше
+    if (displayActive || showPopup)
+    {
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+    else
+    {
+      vTaskDelay(250 / portTICK_PERIOD_MS);
+    }
   }
 }
 
@@ -575,6 +661,7 @@ void setup()
 
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, HIGH);
+
   pinMode(ADC_CTRL_PIN, OUTPUT);
   digitalWrite(ADC_CTRL_PIN, LOW);
 
@@ -587,17 +674,18 @@ void setup()
 
   attachInterrupt(digitalPinToInterrupt(BTN), wifiBtnISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(DISPLAY_BTN_PIN), displayBtnISR, FALLING);
-
-  gpio_wakeup_enable((gpio_num_t)BTN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)SOS_SWITCH_PIN, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)DISPLAY_BTN_PIN, GPIO_INTR_LOW_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
+  attachInterrupt(digitalPinToInterrupt(SOS_SWITCH_PIN), dummyWakeupISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BLE_SWITCH_PIN), dummyWakeupISR, CHANGE);
 
   generateKeyFromPassword(settings_password.c_str());
   randomSeed(esp_random());
   setupPowerSaving();
 
   esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "disp_lock", &display_pm_lock);
+
+  // +++ ОДНЕ ЧИТАННЯ БАТАРЕЇ ДО ЗАПУСКУ ЕКРАНУ +++
+  analogReadResolution(12);
+  readBatteryVoltage();
 
   xTaskCreatePinnedToCore(displayTask, "DisplayTask", 4096, NULL, 1, &DisplayTaskHandle, 0);
 
@@ -629,7 +717,6 @@ void setup()
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
 
-  analogReadResolution(12);
   for (int i = 0; i < QUEUE_SIZE; i++)
     relayQueue[i].active = false;
 
@@ -680,6 +767,8 @@ void loop()
     if (!isConfigMode)
     {
       Serial.println("Кнопка натиснута. Перехід у WiFi AP...");
+      triggerPopup("WIFI AP", COLOR_YELLOW);
+
       esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = false};
       esp_pm_configure(&pm_config);
       if (bleEnabled)
@@ -697,7 +786,15 @@ void loop()
     else
     {
       Serial.println("Вихід з режиму налаштувань. Перезавантаження...");
-      delay(100);
+
+      triggerPopup("REBOOT", COLOR_RED);
+      delay(3000);
+
+      showPopup = false;
+      displayActive = false;
+      delay(200);
+      radio.sleep();
+
       ESP.restart();
     }
   }
@@ -710,16 +807,50 @@ void loop()
     return;
   }
 
-  static bool lastSosState = HIGH;
+  static bool lastSosState = digitalRead(SOS_SWITCH_PIN);
   bool currentSosState = digitalRead(SOS_SWITCH_PIN);
 
   if (currentSosState == LOW && lastSosState == HIGH)
   {
     Serial.println("!!! SOS АКТИВОВАНО - МИТТЄВА ВІДПРАВКА !!!");
+    triggerPopup("! SOS !", COLOR_RED);
+
     hasSentThisMinute = false;
     nextSendTime = millis();
   }
   lastSosState = currentSosState;
+
+  // BLE Management
+  bool switchState = digitalRead(BLE_SWITCH_PIN);
+  if (switchState == LOW && bleEnabled)
+  {
+    triggerPopup("BLE OFF", COLOR_YELLOW);
+    pServer->getAdvertising()->stop();
+    bleEnabled = false;
+    deviceConnected = false;
+  }
+  else if (switchState == HIGH && !bleEnabled)
+  {
+    triggerPopup("BLE ON", COLOR_BLUE);
+    pServer->getAdvertising()->start();
+    bleEnabled = true;
+  }
+
+  if (!deviceConnected && oldDeviceConnected)
+  {
+    if (millis() - lastBleRetryTime > 500)
+    {
+      if (bleEnabled)
+        pServer->startAdvertising();
+      lastBleRetryTime = millis();
+      oldDeviceConnected = deviceConnected;
+    }
+  }
+  if (deviceConnected && !oldDeviceConnected)
+  {
+    oldDeviceConnected = deviceConnected;
+    lastBleRetryTime = 0;
+  }
 
   processGPS(64);
 
@@ -728,7 +859,6 @@ void loop()
   struct tm timeinfo;
   static int lastMinute = -1;
 
-  // +++ ЗМІНЕНО: Додано параметр тайм-ауту 0, щоб уникнути затримок +++
   if (getLocalTime(&timeinfo, 0))
   {
     if (timeinfo.tm_min != lastMinute)
@@ -785,36 +915,6 @@ void loop()
       sleepLoRa();
     processGPS(1024);
     delay(100);
-  }
-
-  // BLE Management
-  bool switchState = digitalRead(BLE_SWITCH_PIN);
-  if (switchState == LOW && bleEnabled)
-  {
-    pServer->getAdvertising()->stop();
-    bleEnabled = false;
-    deviceConnected = false;
-  }
-  else if (switchState == HIGH && !bleEnabled)
-  {
-    pServer->getAdvertising()->start();
-    bleEnabled = true;
-  }
-
-  if (!deviceConnected && oldDeviceConnected)
-  {
-    if (millis() - lastBleRetryTime > 500)
-    {
-      if (bleEnabled)
-        pServer->startAdvertising();
-      lastBleRetryTime = millis();
-      oldDeviceConnected = deviceConnected;
-    }
-  }
-  if (deviceConnected && !oldDeviceConnected)
-  {
-    oldDeviceConnected = deviceConnected;
-    lastBleRetryTime = 0;
   }
 }
 
@@ -987,7 +1087,7 @@ void sendGPSData()
 
 void setupPowerSaving()
 {
-  esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = true};
+  esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 10, .light_sleep_enable = true};
   esp_pm_configure(&pm_config);
 }
 uint16_t calculateCRC(uint8_t *data, size_t len)
@@ -1151,22 +1251,30 @@ uint32_t calculatePacketHash(FullPacket &packet)
   return hash;
 }
 bool isSOS() { return digitalRead(SOS_SWITCH_PIN) == LOW; }
+
+// +++ ОНОВЛЕНА ФУНКЦІЯ ДЛЯ ПЛАТ HELTEC WIRELESS TRACKER +++
 float readBatteryVoltage()
 {
-  digitalWrite(ADC_CTRL_PIN, LOW);
-  delayMicroseconds(100);
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+  delay(15);
   uint32_t adcSum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++)
-    adcSum += analogRead(BATTERY_ADC_PIN);
-  digitalWrite(ADC_CTRL_PIN, HIGH);
+  {
+    adcSum += analogReadMilliVolts(BATTERY_ADC_PIN);
+  }
+  digitalWrite(ADC_CTRL_PIN, LOW);
+
   float adcAverage = (float)adcSum / (float)ADC_SAMPLES;
-  float rawVoltage = (adcAverage / 4095.0) * 3.3 * 4.9;
+  float rawVoltage = (adcAverage / 1000.0) * 4.9;
+
   if (filteredBatteryVoltage == 0.0)
     filteredBatteryVoltage = rawVoltage;
   else
     filteredBatteryVoltage = ADC_FILTER_ALPHA * rawVoltage + (1.0 - ADC_FILTER_ALPHA) * filteredBatteryVoltage;
+
   return filteredBatteryVoltage;
 }
+
 int calculateBatteryLevel(float voltage)
 {
   float v = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
