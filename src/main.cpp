@@ -29,7 +29,7 @@
 // +++ БІБЛІОТЕКИ ДЛЯ ДИСПЛЕЮ +++
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
-#include <U8g2_for_Adafruit_GFX.h> // Бібліотека для кирилиці
+#include <U8g2_for_Adafruit_GFX.h>
 
 // ==========================================
 // ПІНИ ДЛЯ HELTEC WIRELESS TRACKER V1.1 / V1.2
@@ -37,7 +37,6 @@
 #define VEXT_PIN 3
 #define ADC_CTRL_PIN 2
 
-// PINS LoRa SX1262
 #define RADIO_SCLK_PIN 9
 #define RADIO_MISO_PIN 11
 #define RADIO_MOSI_PIN 10
@@ -48,19 +47,16 @@
 
 #define LORA_FREQ 433.0
 
-// PINS GPS (UC6580)
 #define GPS_RX 33
 #define GPS_TX 34
 
 #define BTN 0
 #define BATTERY_ADC_PIN 1
 
-// ПЕРЕМИКАЧІ
 #define BLE_SWITCH_PIN 46
 #define SOS_SWITCH_PIN 47
 #define DISPLAY_BTN_PIN 18
 
-// ПІНИ ДЛЯ TFT ДИСПЛЕЮ
 #define TFT_MOSI 42
 #define TFT_SCLK 41
 #define TFT_CS 38
@@ -68,27 +64,18 @@
 #define TFT_RST 39
 #define TFT_BL 21
 
-// +++ Апаратний SPI для дисплею +++
 SPIClass tftSPI(HSPI);
 Adafruit_ST7735 tft = Adafruit_ST7735(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
-
-// ВІРТУАЛЬНИЙ ЕКРАН В ОПЕРАТИВНІЙ ПАМ'ЯТІ (160x80)
 GFXcanvas16 canvas(160, 80);
-
-// ОБ'ЄКТ ДЛЯ КИРИЛИЦІ
 U8G2_FOR_ADAFRUIT_GFX u8g2ForCanvas;
 
-// ==========================================
 // ГЛОБАЛЬНІ КОЛЬОРИ (BGR ФОРМАТ)
-// ==========================================
 const uint16_t COLOR_GREEN = 0x07E0;
 const uint16_t COLOR_YELLOW = 0x07FF;
 const uint16_t COLOR_RED = 0x001F;
 const uint16_t COLOR_BLUE = 0xF800;
 
-// ==========================================
-// ЗМІННІ ДЛЯ ПОПАПІВ (FULLSCREEN ПОВІДОМЛЕННЯ)
-// ==========================================
+// ЗМІННІ ДЛЯ ПОПАПІВ
 volatile unsigned long popupTimer = 0;
 volatile bool showPopup = false;
 char popupText[20] = "";
@@ -102,7 +89,6 @@ volatile bool forceImmediateUpdate = false;
 volatile uint8_t currentPage = 0;
 #define TOTAL_PAGES 3
 
-// Функція виклику повідомлення на весь екран
 void triggerPopup(const char *text, uint16_t color)
 {
   strncpy(popupText, text, sizeof(popupText) - 1);
@@ -111,15 +97,12 @@ void triggerPopup(const char *text, uint16_t color)
   popupTimer = millis();
   showPopup = true;
 
-  // Примусово будимо екран
   displayActive = true;
   displayTimer = millis();
   forceImmediateUpdate = true;
 }
 
-// ==========================================
 // ЗМІННІ НАЛАШТУВАНЬ ТА ГЛОБАЛЬНІ
-// ==========================================
 String settings_password = "SuperStrongPassword123";
 String settings_name = "Команда 1";
 
@@ -129,13 +112,9 @@ DNSServer dnsServer;
 bool isConfigMode = false;
 
 #define MESH_SIGNATURE 0xB5
-
 uint8_t derivedKey[16];
 bool isKeyInitialized = false;
 
-// ==========================================
-// СТРУКТУРА ПАКЕТУ
-// ==========================================
 struct __attribute__((packed)) LoRaBody
 {
   char deviceId[8];
@@ -176,10 +155,10 @@ const int LONG_LISTEN_INTERVAL_CYCLES = 200;
 #define TYPE_POS 0
 #define TYPE_SOS 1
 
-// --- GLOBALS ---
 int loopCounter = 0;
 bool isLongListenMode = false;
 bool hasSentThisMinute = false;
+bool isGpsAwake = true;
 
 const float ADC_FILTER_ALPHA = 0.1;
 const int ADC_SAMPLES = 20;
@@ -195,16 +174,18 @@ TaskHandle_t DisplayTaskHandle;
 esp_pm_lock_handle_t display_pm_lock;
 
 // ==========================================
-// ПЕРЕРИВАННЯ
+// ПЕРЕРИВАННЯ ТА АНТИБРЯЗКІТ (DEBOUNCE)
 // ==========================================
 volatile bool rxFlag = false;
+volatile unsigned long isrLastTime = 0;
+volatile unsigned long lastSosIsrTime = 0;
+volatile bool wifiBtnFlag = false;
+volatile bool sosChangedFlag = false;
+
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
 #endif
 void setFlag(void) { rxFlag = true; }
-
-volatile unsigned long isrLastTime = 0;
-volatile bool wifiBtnFlag = false;
 
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
@@ -236,25 +217,38 @@ void displayBtnISR()
     {
       currentPage = (currentPage + 1) % TOTAL_PAGES;
     }
-
     forceImmediateUpdate = true;
     displayTimer = millis();
     lastDisplayBtnTime = currentTime;
   }
 }
 
-// Порожнє переривання для безпечного пробудження зі сну
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
 #endif
-void dummyWakeupISR(void)
+void safeWakeupISR(void)
 {
-  // Нічого не робимо. Сам факт переривання розбудить процесор.
+  unsigned long currentTime = (unsigned long)(esp_timer_get_time() / 1000ULL);
+  if (currentTime - lastSosIsrTime > 250)
+  {
+    sosChangedFlag = true;
+    lastSosIsrTime = currentTime;
+  }
 }
 
-// ==========================================
-// ЧЕРГА ТА ІНШІ ЗМІННІ
-// ==========================================
+// +++ ОНОВЛЕНА ГЛИБОКА ЗАТРИМКА +++
+void smartDelay(int ms)
+{
+  unsigned long start = millis();
+  while (millis() - start < (unsigned long)ms)
+  {
+    if (sosChangedFlag || wifiBtnFlag || rxFlag)
+      break;
+    // Даємо FreeRTOS можливість опустити ядро в Light Sleep
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
 struct RelayItem
 {
   FullPacket packet;
@@ -306,6 +300,8 @@ bool isSOS();
 void setupPowerSaving();
 void sleepLoRa();
 void wakeLoRa();
+void sleepGPS();
+void wakeGPS();
 void processGPS(int maxBytes);
 void updateBLE(FullPacket &packet, bool isLocal);
 uint16_t calculateCRC(uint8_t *data, size_t len);
@@ -418,7 +414,7 @@ void displayTask(void *pvParameters)
 
   for (;;)
   {
-    if (displayActive)
+    if (displayActive || showPopup)
     {
       if (!wasActive)
       {
@@ -529,7 +525,13 @@ void displayTask(void *pvParameters)
           {
             canvas.setTextSize(1);
             canvas.setCursor(2, y);
-            if (gps.satellites.isValid() && gps.satellites.value() > 0)
+
+            if (!isGpsAwake)
+            {
+              canvas.setTextColor(COLOR_BLUE);
+              canvas.print("GPS: Sleeping Zzz");
+            }
+            else if (gps.satellites.isValid() && gps.satellites.value() > 0)
             {
               canvas.setTextColor(COLOR_GREEN);
               canvas.printf("GPS Lock: %d Sats", gps.satellites.value());
@@ -640,7 +642,7 @@ void displayTask(void *pvParameters)
         wasActive = false;
       }
     }
-    // Якщо дисплей активний або показуємо попап, оновлюємо частіше
+
     if (displayActive || showPopup)
     {
       vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -674,16 +676,15 @@ void setup()
 
   attachInterrupt(digitalPinToInterrupt(BTN), wifiBtnISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(DISPLAY_BTN_PIN), displayBtnISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(SOS_SWITCH_PIN), dummyWakeupISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(BLE_SWITCH_PIN), dummyWakeupISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(SOS_SWITCH_PIN), safeWakeupISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BLE_SWITCH_PIN), safeWakeupISR, CHANGE);
 
   generateKeyFromPassword(settings_password.c_str());
   randomSeed(esp_random());
-  setupPowerSaving();
 
+  setupPowerSaving();
   esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "disp_lock", &display_pm_lock);
 
-  // +++ ОДНЕ ЧИТАННЯ БАТАРЕЇ ДО ЗАПУСКУ ЕКРАНУ +++
   analogReadResolution(12);
   readBatteryVoltage();
 
@@ -708,7 +709,6 @@ void setup()
   radio.setCRC(true);
   radio.setDio1Action(setFlag);
 
-  // BLE
   BLEDevice::init(("GAMMA-" + String(DEVICE_ID_CONST)).c_str());
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -722,6 +722,41 @@ void setup()
 
   wakeLoRa();
   nextSendTime = millis() + random(2000, 10000);
+}
+
+// ==========================================
+// ФУНКЦІЇ СНУ GPS (Жорсткий режим)
+// ==========================================
+void sleepGPS()
+{
+  if (!isGpsAwake)
+    return;
+
+  // 1. Зупиняємо NMEA спам, щоб шина замовкла
+  gpsSerial.print("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
+  delay(20);
+
+  // 2. Дві команди сну для надійності різних прошивок UC6580
+  gpsSerial.print("$PCAS04,1*18\r\n");
+  delay(20);
+  gpsSerial.print("$PCAS04,5*1C\r\n");
+
+  gpsSerial.flush();
+  isGpsAwake = false;
+}
+
+void wakeGPS()
+{
+  if (isGpsAwake)
+    return;
+
+  // Будимо чіп "сміттєвими" байтами
+  gpsSerial.print("\r\n\r\n");
+  delay(50);
+
+  // Повертаємо стандартний вивід NMEA
+  gpsSerial.print("$PCAS03,1,0,0,1,1,0,0,0,0,0,,,0,0*02\r\n");
+  isGpsAwake = true;
 }
 
 // ==========================================
@@ -761,6 +796,9 @@ bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, 
 // ==========================================
 void loop()
 {
+  if (sosChangedFlag)
+    sosChangedFlag = false;
+
   if (wifiBtnFlag)
   {
     wifiBtnFlag = false;
@@ -780,13 +818,13 @@ void loop()
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       delay(100);
+      wakeGPS();
       isConfigMode = true;
       setupConfigMode();
     }
     else
     {
       Serial.println("Вихід з режиму налаштувань. Перезавантаження...");
-
       triggerPopup("REBOOT", COLOR_RED);
       delay(3000);
 
@@ -794,7 +832,6 @@ void loop()
       displayActive = false;
       delay(200);
       radio.sleep();
-
       ESP.restart();
     }
   }
@@ -817,10 +854,19 @@ void loop()
 
     hasSentThisMinute = false;
     nextSendTime = millis();
+    wakeGPS();
+  }
+  else if (currentSosState == HIGH && lastSosState == LOW)
+  {
+    if (showPopup && strncmp(popupText, "! SOS !", 7) == 0)
+    {
+      showPopup = false;
+      forceImmediateUpdate = true;
+      displayTimer = millis();
+    }
   }
   lastSosState = currentSosState;
 
-  // BLE Management
   bool switchState = digitalRead(BLE_SWITCH_PIN);
   if (switchState == LOW && bleEnabled)
   {
@@ -885,6 +931,9 @@ void loop()
   {
     if (!isLoRaAwake)
       wakeLoRa();
+    if (!isGpsAwake)
+      wakeGPS();
+
     if (rxFlag)
     {
       rxFlag = false;
@@ -907,20 +956,32 @@ void loop()
         }
       }
     }
-    delay(1);
+    smartDelay(10);
   }
   else
   {
     if (isLoRaAwake)
       sleepLoRa();
+    if (isGpsAwake)
+      sleepGPS();
+
     processGPS(1024);
-    delay(100);
+    smartDelay(100);
   }
 }
 
 // ==========================================
 // RX / TX / HELPERS
 // ==========================================
+void setupPowerSaving()
+{
+  esp_pm_config_esp32s3_t pm_config = {
+      .max_freq_mhz = 80,
+      .min_freq_mhz = 10, // ТЕПЕР ЧІТКО ПАДАЄ ДО 10 МГц В СНІ
+      .light_sleep_enable = true};
+  esp_pm_configure(&pm_config);
+}
+
 bool sendSafeLoRa(FullPacket &packet)
 {
   packet.body.crc = calculateCRC((uint8_t *)&packet.body, ENCRYPTED_SIZE - sizeof(uint16_t));
@@ -958,7 +1019,7 @@ bool sendSafeLoRa(FullPacket &packet)
 
 void relayBlind(uint8_t ttl, uint32_t timestamp, uint8_t flags, uint8_t *iv, uint8_t *cipherData)
 {
-  delay(random(50, 150));
+  smartDelay(random(50, 150));
   int cad = radio.scanChannel();
   if (cad == RADIOLIB_LORA_DETECTED || cad == RADIOLIB_PREAMBLE_DETECTED)
   {
@@ -991,10 +1052,12 @@ void receiveLoRaMessage()
   int state = radio.readData(rxBuffer, len);
   if (state != RADIOLIB_ERR_NONE)
     return;
+
   int idx = 0;
   uint8_t sig = rxBuffer[idx++];
   if (sig != MESH_SIGNATURE)
     return;
+
   uint8_t incomingTTL = rxBuffer[idx++];
   uint32_t incomingTimestamp;
   memcpy(&incomingTimestamp, &rxBuffer[idx], 4);
@@ -1009,6 +1072,7 @@ void receiveLoRaMessage()
   idx += IV_SIZE;
   memcpy(cipherBuffer, &rxBuffer[idx], ENCRYPTED_SIZE);
   idx += ENCRYPTED_SIZE;
+
   aesCtrEncryptDecrypt(cipherBuffer, plainBuffer, ENCRYPTED_SIZE, iv);
 
   LoRaBody tempBody;
@@ -1023,8 +1087,10 @@ void receiveLoRaMessage()
     fullRx.flags = incomingFlags;
     fullRx.ttl = incomingTTL;
     memcpy(&fullRx.body, &tempBody, ENCRYPTED_SIZE);
+
     if (strncmp(fullRx.body.deviceId, DEVICE_ID_CONST, 8) == 0)
       return;
+
     if (isPacketUnique(fullRx))
     {
       updateBLE(fullRx, false);
@@ -1047,17 +1113,21 @@ void sendGPSData()
   bool emergency = isSOS();
   if (!gps.location.isValid() && !emergency)
     return;
+
   FullPacket myPacket;
   float vbat = readBatteryVoltage();
   myPacket.ttl = DEFAULT_TTL;
   myPacket.flags = 0;
+
   time_t now;
   time(&now);
   myPacket.timestamp = (uint32_t)now;
+
   memset(myPacket.body.deviceId, 0, 8);
   strncpy(myPacket.body.deviceId, DEVICE_ID_CONST, 8);
   memset(myPacket.body.name, 0, 16);
   strncpy(myPacket.body.name, settings_name.c_str(), 16);
+
   myPacket.body.uid = esp_random();
   myPacket.body.type = emergency ? TYPE_SOS : TYPE_POS;
   myPacket.body.battery = calculateBatteryLevel(vbat);
@@ -1085,11 +1155,6 @@ void sendGPSData()
   }
 }
 
-void setupPowerSaving()
-{
-  esp_pm_config_esp32s3_t pm_config = {.max_freq_mhz = 80, .min_freq_mhz = 10, .light_sleep_enable = true};
-  esp_pm_configure(&pm_config);
-}
 uint16_t calculateCRC(uint8_t *data, size_t len)
 {
   uint16_t crc = 0;
@@ -1101,6 +1166,7 @@ uint16_t calculateCRC(uint8_t *data, size_t len)
   }
   return crc;
 }
+
 void processGPS(int maxBytes)
 {
   int bytesRead = 0;
@@ -1112,6 +1178,7 @@ void processGPS(int maxBytes)
   if (gps.time.isUpdated() && gps.time.isValid() && gps.date.isValid())
     syncWithGPS();
 }
+
 void syncWithGPS()
 {
   struct tm tm;
@@ -1132,6 +1199,7 @@ void syncWithGPS()
     lastGpsUpdateMs = millis();
   }
 }
+
 void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
 {
   if (!(remoteFlags & FLAG_GPS_VALID))
@@ -1147,16 +1215,19 @@ void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags)
     }
   }
 }
+
 void sleepLoRa()
 {
   radio.sleep();
   isLoRaAwake = false;
 }
+
 void wakeLoRa()
 {
   radio.startReceive();
   isLoRaAwake = true;
 }
+
 void enqueueRelay(FullPacket &packet)
 {
   int nextHead = (queueHead + 1) % QUEUE_SIZE;
@@ -1168,6 +1239,7 @@ void enqueueRelay(FullPacket &packet)
   relayQueue[queueHead].retries = 0;
   queueHead = nextHead;
 }
+
 void processRelayQueue()
 {
   if (queueHead == queueTail)
@@ -1193,6 +1265,7 @@ void processRelayQueue()
     }
   }
 }
+
 void updateBLE(FullPacket &packet, bool isLocal)
 {
   if (!bleEnabled || !deviceConnected)
@@ -1228,6 +1301,7 @@ void updateBLE(FullPacket &packet, bool isLocal)
   pCharacteristic->setValue(buffer);
   pCharacteristic->notify();
 }
+
 bool isPacketUnique(FullPacket &packet)
 {
   uint32_t msgHash = calculatePacketHash(packet);
@@ -1237,11 +1311,13 @@ bool isPacketUnique(FullPacket &packet)
   addHashToHistory(msgHash);
   return true;
 }
+
 void addHashToHistory(uint32_t hash)
 {
   messageHistory[historyIndex] = hash;
   historyIndex = (historyIndex + 1) % MESSAGE_HISTORY_SIZE;
 }
+
 uint32_t calculatePacketHash(FullPacket &packet)
 {
   uint32_t hash = 5381;
@@ -1250,9 +1326,9 @@ uint32_t calculatePacketHash(FullPacket &packet)
   hash = ((hash << 5) + hash) + packet.body.uid;
   return hash;
 }
+
 bool isSOS() { return digitalRead(SOS_SWITCH_PIN) == LOW; }
 
-// +++ ОНОВЛЕНА ФУНКЦІЯ ДЛЯ ПЛАТ HELTEC WIRELESS TRACKER +++
 float readBatteryVoltage()
 {
   digitalWrite(ADC_CTRL_PIN, HIGH);
