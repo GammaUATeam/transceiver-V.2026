@@ -55,7 +55,10 @@
 
 #define BLE_SWITCH_PIN 46
 #define SOS_SWITCH_PIN 47
-#define DISPLAY_BTN_PIN 18
+#define DISPLAY_BTN_PIN 17
+
+// ПІН ДЛЯ АПАРАТНОГО ВИМИКАЧА (ТУМБЛЕРА)
+#define POWER_SWITCH_PIN 4
 
 #define TFT_MOSI 42
 #define TFT_SCLK 41
@@ -65,7 +68,20 @@
 #define TFT_BL 21
 
 SPIClass tftSPI(HSPI);
-Adafruit_ST7735 tft = Adafruit_ST7735(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
+
+// +++ КЛАС-ОБГОРТКА ДЛЯ ЖОРСТКОГО КОНТРОЛЮ ЗСУВУ ЕКРАНУ +++
+class CustomTFT : public Adafruit_ST7735
+{
+public:
+  CustomTFT(SPIClass *spi, int8_t cs, int8_t dc, int8_t rst) : Adafruit_ST7735(spi, cs, dc, rst) {}
+  void setOffset(int8_t x, int8_t y)
+  {
+    _xstart = x;
+    _ystart = y;
+  }
+};
+
+CustomTFT tft(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 GFXcanvas16 canvas(160, 80);
 U8G2_FOR_ADAFRUIT_GFX u8g2ForCanvas;
 
@@ -110,6 +126,7 @@ Preferences preferences;
 WebServer server(80);
 DNSServer dnsServer;
 bool isConfigMode = false;
+bool isSystemInitialized = false;
 
 #define MESH_SIGNATURE 0xB5
 uint8_t derivedKey[16];
@@ -141,7 +158,7 @@ struct FullPacket
 #define IV_SIZE 16
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
-const char *DEVICE_ID_CONST = "h3";
+const char *DEVICE_ID_CONST = "h1";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 #define DEFAULT_TTL 3
 #define baud_rate 115200
@@ -236,7 +253,6 @@ void safeWakeupISR(void)
   }
 }
 
-// +++ ОНОВЛЕНА ГЛИБОКА ЗАТРИМКА +++
 void smartDelay(int ms)
 {
   unsigned long start = millis();
@@ -244,15 +260,16 @@ void smartDelay(int ms)
   {
     if (sosChangedFlag || wifiBtnFlag || rxFlag)
       break;
-    // Даємо FreeRTOS можливість опустити ядро в Light Sleep
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
+// ЧЕРГА ВІДПРАВКИ
 struct RelayItem
 {
   FullPacket packet;
-  unsigned long triggerTime;
+  unsigned long queuedTime;
+  unsigned long delayMs;
   bool active;
   uint8_t retries;
 };
@@ -263,7 +280,11 @@ int queueHead = 0;
 int queueTail = 0;
 
 JsonDocument docDisplay;
-unsigned long nextSendTime = 0;
+
+// ТАЙМЕРИ ВІДПРАВКИ
+unsigned long lastSendTime = 0;
+unsigned long sendInterval = 0;
+
 bool isLoRaAwake = true;
 unsigned long lastGpsUpdateMs = 0;
 const unsigned long GPS_TIMEOUT_MS = 3600000;
@@ -283,6 +304,7 @@ unsigned long lastBleRetryTime = 0;
 #define CHARACTERISTIC_UUID "d792d09f-1d6e-422b-991a-e2933e7d848b"
 
 // Прототипи
+void enterDeepSleep();
 void sendGPSData();
 bool sendSafeLoRa(FullPacket &packet);
 void receiveLoRaMessage();
@@ -391,6 +413,26 @@ void handleSave()
   }
 }
 
+void enterDeepSleep()
+{
+  Serial.println("Power switch is OFF. Going to Deep Sleep...");
+
+  if (isSystemInitialized)
+  {
+    digitalWrite(TFT_BL, LOW);
+    tft.fillScreen(ST77XX_BLACK);
+
+    if (isLoRaAwake)
+      radio.sleep();
+    if (isGpsAwake)
+      sleepGPS();
+  }
+
+  digitalWrite(VEXT_PIN, LOW);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)POWER_SWITCH_PIN, 0);
+  esp_deep_sleep_start();
+}
+
 // ==========================================
 // ЗАДАЧА ДИСПЛЕЮ НА ЯДРІ 0 (Core 0)
 // ==========================================
@@ -400,17 +442,57 @@ void displayTask(void *pvParameters)
   digitalWrite(TFT_BL, LOW);
 
   tftSPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-  tft.initR(INITR_BLACKTAB);
-  tft.fillScreen(ST77XX_BLACK);
   tft.initR(INITR_MINI160x80);
-  tft.setRotation(3);
+  tft.setRotation(1);
   tft.invertDisplay(true);
+
+  // +++ ПОКРАЩЕНА "ЩІТКА" (стирає і по X, і по Y) +++
+  for (int x = 0; x <= 2; x++)
+  {
+    for (int y = 23; y <= 28; y++)
+    {
+      tft.setOffset(x, y);
+      tft.fillScreen(ST77XX_BLACK);
+    }
+  }
+
+  // Встановлюємо фінальний зсув:
+  // Перша цифра (0) ховає бокові смужки.
+  // Друга цифра (26) посуне картинку вниз і сховає смужку знизу.
+  tft.setOffset(0, 26);
 
   u8g2ForCanvas.begin(canvas);
   u8g2ForCanvas.setFontMode(1);
   u8g2ForCanvas.setFontDirection(0);
 
-  bool wasActive = false;
+  // +++ SPLASH SCREEN (ЗАСТАВКА ПРИ СТАРТІ) +++
+  esp_pm_lock_acquire(display_pm_lock);
+  bool wasActive = true;
+
+  canvas.fillScreen(ST77XX_BLACK);
+  canvas.setTextWrap(false);
+  canvas.setTextColor(COLOR_GREEN);
+  canvas.setTextSize(2);
+
+  char splashText[20];
+  sprintf(splashText, "GAMMA-%s", DEVICE_ID_CONST);
+
+  int pxWidth = strlen(splashText) * 12;
+  int x = (160 - pxWidth) / 2;
+  int y = (80 - 16) / 2;
+
+  canvas.setCursor(x > 0 ? x : 0, y);
+  canvas.print(splashText);
+
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 160, 80);
+  digitalWrite(TFT_BL, HIGH);
+
+  vTaskDelay(1000 / portTICK_PERIOD_MS); // Світимо 1 секунду
+
+  displayActive = true;
+  displayTimer = millis();
+  forceImmediateUpdate = true;
+  // +++ КІНЕЦЬ ЗАСТАВКИ +++
 
   for (;;)
   {
@@ -460,7 +542,7 @@ void displayTask(void *pvParameters)
           displayTimer = currentMillis;
         }
       }
-      else if (currentMillis - displayTimer <= 10000)
+      else if (currentMillis - displayTimer <= 5000)
       {
         static unsigned long lastUpdate = 0;
 
@@ -484,6 +566,25 @@ void displayTask(void *pvParameters)
           {
             canvas.setTextColor(ST77XX_WHITE);
             canvas.printf("%s", DEVICE_ID_CONST);
+
+            canvas.setCursor(30, 2);
+            if (isConfigMode)
+            {
+              canvas.setTextColor(COLOR_YELLOW);
+              canvas.print("WIFI");
+            }
+            else if (bleEnabled)
+            {
+              if (deviceConnected)
+              {
+                canvas.setTextColor(COLOR_GREEN);
+              }
+              else
+              {
+                canvas.setTextColor(COLOR_BLUE);
+              }
+              canvas.print("BLE");
+            }
           }
 
           char timeStr[10] = "--:--";
@@ -586,14 +687,25 @@ void displayTask(void *pvParameters)
             canvas.printf("%s", settings_password.c_str());
 
             y += 16;
-            int relayCount = 0;
-            for (int i = 0; i < QUEUE_SIZE; i++)
-            {
-              if (relayQueue[i].active)
-                relayCount++;
-            }
             canvas.setCursor(2, y);
-            canvas.printf("Queue: %d msg", relayCount);
+
+            if (isConfigMode)
+            {
+              canvas.setTextColor(COLOR_YELLOW);
+              canvas.print("IP: ");
+              canvas.print(WiFi.softAPIP().toString().c_str());
+              canvas.setTextColor(ST77XX_WHITE);
+            }
+            else
+            {
+              int relayCount = 0;
+              for (int i = 0; i < QUEUE_SIZE; i++)
+              {
+                if (relayQueue[i].active)
+                  relayCount++;
+              }
+              canvas.printf("Queue: %d msg", relayCount);
+            }
 
             y += 14;
             canvas.setCursor(2, y);
@@ -661,6 +773,19 @@ void setup()
 {
   Serial.begin(115200);
 
+  // +++ НАЛАШТУВАННЯ ЧАСОВОГО ПОЯСУ (КИЇВ) +++
+  // EET-2EEST налаштовує перехід на зимовий/літній час для України
+  setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
+  tzset();
+
+  pinMode(POWER_SWITCH_PIN, INPUT_PULLUP);
+  delay(10);
+
+  if (digitalRead(POWER_SWITCH_PIN) == HIGH)
+  {
+    enterDeepSleep();
+  }
+
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, HIGH);
 
@@ -721,7 +846,11 @@ void setup()
     relayQueue[i].active = false;
 
   wakeLoRa();
-  nextSendTime = millis() + random(2000, 10000);
+
+  lastSendTime = millis();
+  sendInterval = random(2000, 10000);
+
+  isSystemInitialized = true;
 }
 
 // ==========================================
@@ -732,11 +861,8 @@ void sleepGPS()
   if (!isGpsAwake)
     return;
 
-  // 1. Зупиняємо NMEA спам, щоб шина замовкла
   gpsSerial.print("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
   delay(20);
-
-  // 2. Дві команди сну для надійності різних прошивок UC6580
   gpsSerial.print("$PCAS04,1*18\r\n");
   delay(20);
   gpsSerial.print("$PCAS04,5*1C\r\n");
@@ -750,11 +876,8 @@ void wakeGPS()
   if (isGpsAwake)
     return;
 
-  // Будимо чіп "сміттєвими" байтами
   gpsSerial.print("\r\n\r\n");
   delay(50);
-
-  // Повертаємо стандартний вивід NMEA
   gpsSerial.print("$PCAS03,1,0,0,1,1,0,0,0,0,0,,,0,0*02\r\n");
   isGpsAwake = true;
 }
@@ -796,6 +919,15 @@ bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, 
 // ==========================================
 void loop()
 {
+  if (digitalRead(POWER_SWITCH_PIN) == HIGH)
+  {
+    delay(50);
+    if (digitalRead(POWER_SWITCH_PIN) == HIGH)
+    {
+      enterDeepSleep();
+    }
+  }
+
   if (sosChangedFlag)
     sosChangedFlag = false;
 
@@ -853,7 +985,8 @@ void loop()
     triggerPopup("! SOS !", COLOR_RED);
 
     hasSentThisMinute = false;
-    nextSendTime = millis();
+    lastSendTime = millis();
+    sendInterval = 0;
     wakeGPS();
   }
   else if (currentSosState == HIGH && lastSosState == LOW)
@@ -913,7 +1046,9 @@ void loop()
       loopCounter++;
       isLongListenMode = (loopCounter % LONG_LISTEN_INTERVAL_CYCLES == 0);
       hasSentThisMinute = false;
-      nextSendTime = millis() + random(1000, 15000);
+
+      lastSendTime = millis();
+      sendInterval = random(1000, 15000);
     }
     if (!isLongListenMode)
     {
@@ -938,21 +1073,31 @@ void loop()
     {
       rxFlag = false;
       receiveLoRaMessage();
-      if (millis() >= nextSendTime - 1000)
-        nextSendTime += random(500, 1500);
+
+      unsigned long safeOffset = (sendInterval > 1000) ? (sendInterval - 1000) : 0;
+      if (millis() - lastSendTime >= safeOffset)
+      {
+        sendInterval += random(500, 1500);
+      }
     }
     else
     {
       if (txAllowed)
       {
         processRelayQueue();
-        if (millis() >= nextSendTime && !hasSentThisMinute)
+
+        if (millis() - lastSendTime >= sendInterval && !hasSentThisMinute)
         {
           sendGPSData();
           if (!isSOS())
+          {
             hasSentThisMinute = true;
+          }
           else
-            nextSendTime = millis() + 10000;
+          {
+            lastSendTime = millis();
+            sendInterval = 10000;
+          }
         }
       }
     }
@@ -977,7 +1122,7 @@ void setupPowerSaving()
 {
   esp_pm_config_esp32s3_t pm_config = {
       .max_freq_mhz = 80,
-      .min_freq_mhz = 10, // ТЕПЕР ЧІТКО ПАДАЄ ДО 10 МГц В СНІ
+      .min_freq_mhz = 10,
       .light_sleep_enable = true};
   esp_pm_configure(&pm_config);
 }
@@ -1189,7 +1334,17 @@ void syncWithGPS()
   tm.tm_min = gps.time.minute();
   tm.tm_sec = gps.time.second();
   tm.tm_isdst = 0;
+
+  // +++ КОНВЕРТАЦІЯ GPS UTC В КИЇВСЬКИЙ ЧАС +++
+  // Тимчасово кажемо системі, що ми в нульовому поясі, щоб отримати чистий UNIX-час
+  setenv("TZ", "UTC", 1);
+  tzset();
   time_t t = mktime(&tm);
+
+  // Повертаємо Київський пояс назад
+  setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
+  tzset();
+
   struct timeval now = {.tv_sec = t, .tv_usec = 0};
   time_t current;
   time(&current);
@@ -1234,7 +1389,10 @@ void enqueueRelay(FullPacket &packet)
   if (nextHead == queueTail)
     queueTail = (queueTail + 1) % QUEUE_SIZE;
   relayQueue[queueHead].packet = packet;
-  relayQueue[queueHead].triggerTime = millis() + random(100, 1000);
+
+  relayQueue[queueHead].queuedTime = millis();
+  relayQueue[queueHead].delayMs = random(100, 1000);
+
   relayQueue[queueHead].active = true;
   relayQueue[queueHead].retries = 0;
   queueHead = nextHead;
@@ -1245,7 +1403,8 @@ void processRelayQueue()
   if (queueHead == queueTail)
     return;
   RelayItem *item = &relayQueue[queueTail];
-  if (item->active && millis() >= item->triggerTime)
+
+  if (item->active && (millis() - item->queuedTime >= item->delayMs))
   {
     if (sendSafeLoRa(item->packet))
     {
@@ -1261,7 +1420,10 @@ void processRelayQueue()
         queueTail = (queueTail + 1) % QUEUE_SIZE;
       }
       else
-        item->triggerTime = millis() + random(1000, 3000);
+      {
+        item->queuedTime = millis();
+        item->delayMs = random(1000, 3000);
+      }
     }
   }
 }
