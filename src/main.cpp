@@ -158,7 +158,7 @@ struct FullPacket
 #define IV_SIZE 16
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
-const char *DEVICE_ID_CONST = "h1";
+const char *DEVICE_ID_CONST = "h4";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 #define DEFAULT_TTL 3
 #define baud_rate 115200
@@ -413,6 +413,7 @@ void handleSave()
   }
 }
 
+// ОНОВЛЕНА ФУНКЦІЯ ГЛИБОКОГО СНУ
 void enterDeepSleep()
 {
   Serial.println("Power switch is OFF. Going to Deep Sleep...");
@@ -428,7 +429,25 @@ void enterDeepSleep()
       sleepGPS();
   }
 
+  // 1. Надійно вимикаємо всі лінії живлення периферії
   digitalWrite(VEXT_PIN, LOW);
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  digitalWrite(TFT_BL, LOW);
+
+  // 2. Утримуємо стан пінів у режимі сну! (Критично важливо)
+  gpio_hold_en((gpio_num_t)VEXT_PIN);
+  gpio_hold_en((gpio_num_t)ADC_CTRL_PIN);
+  gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_deep_sleep_hold_en(); // Активує утримання станів для всього чіпа уві сні
+
+  // 3. Відключаємо паразитне живлення (ізолюємо UART/SPI)
+  pinMode(GPS_TX, INPUT);
+  pinMode(GPS_RX, INPUT);
+  pinMode(RADIO_MOSI_PIN, INPUT);
+  pinMode(RADIO_SCLK_PIN, INPUT);
+  pinMode(RADIO_CS_PIN, INPUT);
+  pinMode(RADIO_MISO_PIN, INPUT);
+
   esp_sleep_enable_ext0_wakeup((gpio_num_t)POWER_SWITCH_PIN, 0);
   esp_deep_sleep_start();
 }
@@ -502,6 +521,9 @@ void displayTask(void *pvParameters)
       {
         esp_pm_lock_acquire(display_pm_lock);
         wasActive = true;
+
+        // +++ ОНОВЛЕННЯ 1: Заміряємо батарею при пробудженні екрану +++
+        readBatteryVoltage();
       }
 
       unsigned long currentMillis = millis();
@@ -548,6 +570,12 @@ void displayTask(void *pvParameters)
 
         if (forceImmediateUpdate || currentMillis - lastUpdate > 500)
         {
+          // +++ ОНОВЛЕННЯ 2: Заміряємо батарею при примусовому оновленні (натискання кнопки) +++
+          if (forceImmediateUpdate)
+          {
+            readBatteryVoltage();
+          }
+
           forceImmediateUpdate = false;
           lastUpdate = currentMillis;
 
@@ -767,11 +795,17 @@ void displayTask(void *pvParameters)
 }
 
 // ==========================================
-// SETUP
+// SETUP З ДОДАНИМ РОЗБЛОКУВАННЯМ ПІНІВ
 // ==========================================
 void setup()
 {
   Serial.begin(115200);
+
+  // Знімаємо блокування пінів після виходу з Deep Sleep
+  gpio_hold_dis((gpio_num_t)VEXT_PIN);
+  gpio_hold_dis((gpio_num_t)ADC_CTRL_PIN);
+  gpio_hold_dis((gpio_num_t)TFT_BL);
+  gpio_deep_sleep_hold_dis();
 
   // +++ НАЛАШТУВАННЯ ЧАСОВОГО ПОЯСУ (КИЇВ) +++
   // EET-2EEST налаштовує перехід на зимовий/літній час для України
