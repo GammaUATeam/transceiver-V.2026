@@ -15,6 +15,7 @@
 #include "esp_system.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "driver/rtc_io.h"
 
 // +++ ДОДАТКОВІ БІБЛІОТЕКИ ДЛЯ WIFI ТА НАЛАШТУВАНЬ +++
 #include <WiFi.h>
@@ -69,7 +70,6 @@
 
 SPIClass tftSPI(HSPI);
 
-// +++ КЛАС-ОБГОРТКА ДЛЯ ЖОРСТКОГО КОНТРОЛЮ ЗСУВУ ЕКРАНУ +++
 class CustomTFT : public Adafruit_ST7735
 {
 public:
@@ -85,19 +85,16 @@ CustomTFT tft(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 GFXcanvas16 canvas(160, 80);
 U8G2_FOR_ADAFRUIT_GFX u8g2ForCanvas;
 
-// ГЛОБАЛЬНІ КОЛЬОРИ (BGR ФОРМАТ)
 const uint16_t COLOR_GREEN = 0x07E0;
 const uint16_t COLOR_YELLOW = 0x07FF;
 const uint16_t COLOR_RED = 0x001F;
 const uint16_t COLOR_BLUE = 0xF800;
 
-// ЗМІННІ ДЛЯ ПОПАПІВ
 volatile unsigned long popupTimer = 0;
 volatile bool showPopup = false;
 char popupText[20] = "";
 uint16_t popupColor = ST77XX_WHITE;
 
-// Змінні дисплею
 volatile bool displayActive = false;
 volatile unsigned long displayTimer = 0;
 volatile unsigned long lastDisplayBtnTime = 0;
@@ -118,7 +115,6 @@ void triggerPopup(const char *text, uint16_t color)
   forceImmediateUpdate = true;
 }
 
-// ЗМІННІ НАЛАШТУВАНЬ ТА ГЛОБАЛЬНІ
 String settings_password = "SuperStrongPassword123";
 String settings_name = "Команда 1";
 
@@ -158,7 +154,7 @@ struct FullPacket
 #define IV_SIZE 16
 #define RADIO_PACKET_SIZE (1 + 1 + 4 + 1 + IV_SIZE + ENCRYPTED_SIZE)
 
-const char *DEVICE_ID_CONST = "h4";
+const char *DEVICE_ID_CONST = "h1";
 #define LOCAL_DISPLAY_ID DEVICE_ID_CONST
 #define DEFAULT_TTL 3
 #define baud_rate 115200
@@ -190,9 +186,6 @@ SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUS
 TaskHandle_t DisplayTaskHandle;
 esp_pm_lock_handle_t display_pm_lock;
 
-// ==========================================
-// ПЕРЕРИВАННЯ ТА АНТИБРЯЗКІТ (DEBOUNCE)
-// ==========================================
 volatile bool rxFlag = false;
 volatile unsigned long isrLastTime = 0;
 volatile unsigned long lastSosIsrTime = 0;
@@ -264,7 +257,6 @@ void smartDelay(int ms)
   }
 }
 
-// ЧЕРГА ВІДПРАВКИ
 struct RelayItem
 {
   FullPacket packet;
@@ -281,7 +273,6 @@ int queueTail = 0;
 
 JsonDocument docDisplay;
 
-// ТАЙМЕРИ ВІДПРАВКИ
 unsigned long lastSendTime = 0;
 unsigned long sendInterval = 0;
 
@@ -303,7 +294,6 @@ unsigned long lastBleRetryTime = 0;
 #define SERVICE_UUID "a066b5b0-c522-4aa9-b148-8f24f37fcba6"
 #define CHARACTERISTIC_UUID "d792d09f-1d6e-422b-991a-e2933e7d848b"
 
-// Прототипи
 void enterDeepSleep();
 void sendGPSData();
 bool sendSafeLoRa(FullPacket &packet);
@@ -413,7 +403,9 @@ void handleSave()
   }
 }
 
-// ОНОВЛЕНА ФУНКЦІЯ ГЛИБОКОГО СНУ
+// ==========================================
+// ФУНКЦІЯ ГЛИБОКОГО СНУ (ФІКС ФАНТОМНОГО ПЕРЕЗАВАНТАЖЕННЯ)
+// ==========================================
 void enterDeepSleep()
 {
   Serial.println("Power switch is OFF. Going to Deep Sleep...");
@@ -427,26 +419,54 @@ void enterDeepSleep()
       radio.sleep();
     if (isGpsAwake)
       sleepGPS();
+
+    tftSPI.end();
+    SPI.end();
+    gpsSerial.end();
   }
 
-  // 1. Надійно вимикаємо всі лінії живлення периферії
   digitalWrite(VEXT_PIN, LOW);
   digitalWrite(ADC_CTRL_PIN, LOW);
   digitalWrite(TFT_BL, LOW);
 
-  // 2. Утримуємо стан пінів у режимі сну! (Критично важливо)
   gpio_hold_en((gpio_num_t)VEXT_PIN);
   gpio_hold_en((gpio_num_t)ADC_CTRL_PIN);
   gpio_hold_en((gpio_num_t)TFT_BL);
-  gpio_deep_sleep_hold_en(); // Активує утримання станів для всього чіпа уві сні
 
-  // 3. Відключаємо паразитне живлення (ізолюємо UART/SPI)
-  pinMode(GPS_TX, INPUT);
-  pinMode(GPS_RX, INPUT);
-  pinMode(RADIO_MOSI_PIN, INPUT);
-  pinMode(RADIO_SCLK_PIN, INPUT);
-  pinMode(RADIO_CS_PIN, INPUT);
-  pinMode(RADIO_MISO_PIN, INPUT);
+  gpio_reset_pin((gpio_num_t)TFT_MOSI);
+  gpio_reset_pin((gpio_num_t)TFT_SCLK);
+  gpio_reset_pin((gpio_num_t)TFT_CS);
+  gpio_reset_pin((gpio_num_t)TFT_DC);
+  gpio_reset_pin((gpio_num_t)TFT_RST);
+
+  gpio_reset_pin((gpio_num_t)GPS_RX);
+  gpio_reset_pin((gpio_num_t)GPS_TX);
+
+  gpio_reset_pin((gpio_num_t)35);
+
+  gpio_reset_pin((gpio_num_t)RADIO_MOSI_PIN);
+  gpio_reset_pin((gpio_num_t)RADIO_SCLK_PIN);
+  gpio_reset_pin((gpio_num_t)RADIO_MISO_PIN);
+
+  pinMode(RADIO_CS_PIN, OUTPUT);
+  digitalWrite(RADIO_CS_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)RADIO_CS_PIN);
+
+  pinMode(RADIO_RST_PIN, OUTPUT);
+  digitalWrite(RADIO_RST_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)RADIO_RST_PIN);
+
+  gpio_deep_sleep_hold_en();
+
+  // +++ ФІКС BOOT-LOOP: Зберігаємо живлення RTC-домену +++
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+  // Вмикаємо жорстку підтяжку (pull-up) і вимикаємо притягування до землі (pull-down)
+  rtc_gpio_pullup_en((gpio_num_t)POWER_SWITCH_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)POWER_SWITCH_PIN);
+
+  // Дочекатися, поки Serial відправить всі байти, щоб не розбудити чіп перериванням UART
+  Serial.flush();
 
   esp_sleep_enable_ext0_wakeup((gpio_num_t)POWER_SWITCH_PIN, 0);
   esp_deep_sleep_start();
@@ -465,7 +485,6 @@ void displayTask(void *pvParameters)
   tft.setRotation(1);
   tft.invertDisplay(true);
 
-  // +++ ПОКРАЩЕНА "ЩІТКА" (стирає і по X, і по Y) +++
   for (int x = 0; x <= 2; x++)
   {
     for (int y = 23; y <= 28; y++)
@@ -475,16 +494,12 @@ void displayTask(void *pvParameters)
     }
   }
 
-  // Встановлюємо фінальний зсув:
-  // Перша цифра (0) ховає бокові смужки.
-  // Друга цифра (26) посуне картинку вниз і сховає смужку знизу.
   tft.setOffset(0, 26);
 
   u8g2ForCanvas.begin(canvas);
   u8g2ForCanvas.setFontMode(1);
   u8g2ForCanvas.setFontDirection(0);
 
-  // +++ SPLASH SCREEN (ЗАСТАВКА ПРИ СТАРТІ) +++
   esp_pm_lock_acquire(display_pm_lock);
   bool wasActive = true;
 
@@ -506,12 +521,11 @@ void displayTask(void *pvParameters)
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 160, 80);
   digitalWrite(TFT_BL, HIGH);
 
-  vTaskDelay(1000 / portTICK_PERIOD_MS); // Світимо 1 секунду
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 
   displayActive = true;
   displayTimer = millis();
   forceImmediateUpdate = true;
-  // +++ КІНЕЦЬ ЗАСТАВКИ +++
 
   for (;;)
   {
@@ -521,8 +535,6 @@ void displayTask(void *pvParameters)
       {
         esp_pm_lock_acquire(display_pm_lock);
         wasActive = true;
-
-        // +++ ОНОВЛЕННЯ 1: Заміряємо батарею при пробудженні екрану +++
         readBatteryVoltage();
       }
 
@@ -570,7 +582,6 @@ void displayTask(void *pvParameters)
 
         if (forceImmediateUpdate || currentMillis - lastUpdate > 500)
         {
-          // +++ ОНОВЛЕННЯ 2: Заміряємо батарею при примусовому оновленні (натискання кнопки) +++
           if (forceImmediateUpdate)
           {
             readBatteryVoltage();
@@ -795,20 +806,21 @@ void displayTask(void *pvParameters)
 }
 
 // ==========================================
-// SETUP З ДОДАНИМ РОЗБЛОКУВАННЯМ ПІНІВ
+// SETUP
 // ==========================================
 void setup()
 {
   Serial.begin(115200);
 
-  // Знімаємо блокування пінів після виходу з Deep Sleep
   gpio_hold_dis((gpio_num_t)VEXT_PIN);
   gpio_hold_dis((gpio_num_t)ADC_CTRL_PIN);
   gpio_hold_dis((gpio_num_t)TFT_BL);
+  gpio_hold_dis((gpio_num_t)RADIO_CS_PIN);
+  gpio_hold_dis((gpio_num_t)RADIO_RST_PIN);
   gpio_deep_sleep_hold_dis();
 
-  // +++ НАЛАШТУВАННЯ ЧАСОВОГО ПОЯСУ (КИЇВ) +++
-  // EET-2EEST налаштовує перехід на зимовий/літній час для України
+  rtc_gpio_deinit((gpio_num_t)POWER_SWITCH_PIN);
+
   setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
   tzset();
 
@@ -1369,13 +1381,10 @@ void syncWithGPS()
   tm.tm_sec = gps.time.second();
   tm.tm_isdst = 0;
 
-  // +++ КОНВЕРТАЦІЯ GPS UTC В КИЇВСЬКИЙ ЧАС +++
-  // Тимчасово кажемо системі, що ми в нульовому поясі, щоб отримати чистий UNIX-час
   setenv("TZ", "UTC", 1);
   tzset();
   time_t t = mktime(&tm);
 
-  // Повертаємо Київський пояс назад
   setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
   tzset();
 
