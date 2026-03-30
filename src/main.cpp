@@ -1546,7 +1546,9 @@ float readBatteryVoltage()
   digitalWrite(ADC_CTRL_PIN, LOW);
 
   float adcAverage = (float)adcSum / (float)ADC_SAMPLES;
-  float rawVoltage = (adcAverage / 1000.0) * 4.9;
+
+  // Змінено коефіцієнт з 4.9 на 5.1 (більш точний для плат Heltec)
+  float rawVoltage = (adcAverage / 1000.0) * 5.12;
 
   if (filteredBatteryVoltage == 0.0)
     filteredBatteryVoltage = rawVoltage;
@@ -1558,6 +1560,13 @@ float readBatteryVoltage()
 
 int calculateBatteryLevel(float voltage)
 {
-  float v = constrain(voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
-  return map(v * 100, BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100, 0, 100);
+  // Жорсткі межі, щоб відсоток не вийшов за 0-100%
+  if (voltage >= BATTERY_MAX_VOLTAGE)
+    return 100;
+  if (voltage <= BATTERY_MIN_VOLTAGE)
+    return 0;
+
+  // Чиста математика з плаваючою комою замість цілочисельного map()
+  float percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0;
+  return (int)round(percentage);
 }
