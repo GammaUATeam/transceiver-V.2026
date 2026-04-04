@@ -61,6 +61,9 @@
 // ПІН ДЛЯ АПАРАТНОГО ВИМИКАЧА (ТУМБЛЕРА)
 #define POWER_SWITCH_PIN 4
 
+// ПІН ДЛЯ СТАТУСНОГО СВІТЛОДІОДА
+#define STATUS_LED_PIN 5
+
 #define TFT_MOSI 42
 #define TFT_SCLK 41
 #define TFT_CS 38
@@ -123,6 +126,15 @@ WebServer server(80);
 DNSServer dnsServer;
 bool isConfigMode = false;
 bool isSystemInitialized = false;
+
+// +++ BLE ЗМІННІ (перенесено сюди для видимості у функції діода) +++
+BLECharacteristic *pCharacteristic;
+BLEServer *pServer;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+bool bleEnabled = false;
+unsigned long lastBleRetryTime = 0;
+// +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 #define MESH_SIGNATURE 0xB5
 uint8_t derivedKey[16];
@@ -192,6 +204,51 @@ volatile unsigned long lastSosIsrTime = 0;
 volatile bool wifiBtnFlag = false;
 volatile bool sosChangedFlag = false;
 
+// ==========================================
+// ФУНКЦІЯ КЕРУВАННЯ ПАТЕРНАМИ СВІТЛОДІОДА
+// ==========================================
+bool isSOS(); // Попередня декларація
+
+void updateStatusLED()
+{
+  // Якщо тумблер вимкнено - діод не світиться
+  if (digitalRead(POWER_SWITCH_PIN) == HIGH)
+    return;
+
+  unsigned long t = millis();
+
+  if (isSOS())
+  {
+    // SOS: Швидке і агресивне блимання (150мс увімк, 150мс вимк)
+    digitalWrite(STATUS_LED_PIN, (t % 300 < 150) ? HIGH : LOW);
+  }
+  else if (isConfigMode)
+  {
+    // WiFi Налаштування: Подвійне блимання
+    int cycle = t % 1500;
+    digitalWrite(STATUS_LED_PIN, (cycle < 150 || (cycle > 300 && cycle < 450)) ? HIGH : LOW);
+  }
+  else if (bleEnabled)
+  {
+    if (deviceConnected)
+    {
+      // BLE підключено: Довгий повільний імпульс кожні 2 сек
+      digitalWrite(STATUS_LED_PIN, (t % 2000 < 600) ? HIGH : LOW);
+    }
+    else
+    {
+      // BLE увімкнено, чекає підключення: Короткий спалах кожні 2 сек
+      digitalWrite(STATUS_LED_PIN, (t % 2000 < 150) ? HIGH : LOW);
+    }
+  }
+  else
+  {
+    // Нормальний режим: Приємне "серцебиття" кожні 3 секунди
+    int cycle = t % 3000;
+    digitalWrite(STATUS_LED_PIN, (cycle < 100 || (cycle > 250 && cycle < 350)) ? HIGH : LOW);
+  }
+}
+
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
 #endif
@@ -251,9 +308,13 @@ void smartDelay(int ms)
   unsigned long start = millis();
   while (millis() - start < (unsigned long)ms)
   {
+    updateStatusLED(); // Оновлюємо діод під час затримок
+
     if (sosChangedFlag || wifiBtnFlag || rxFlag)
       break;
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+
+    // Зменшив до 20мс для плавності діода, це не навантажить процесор
+    vTaskDelay(20 / portTICK_PERIOD_MS);
   }
 }
 
@@ -284,13 +345,6 @@ const unsigned long GPS_TIMEOUT_MS = 3600000;
 uint32_t messageHistory[MESSAGE_HISTORY_SIZE];
 int historyIndex = 0;
 
-BLECharacteristic *pCharacteristic;
-BLEServer *pServer;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
-bool bleEnabled = false;
-unsigned long lastBleRetryTime = 0;
-
 #define SERVICE_UUID "a066b5b0-c522-4aa9-b148-8f24f37fcba6"
 #define CHARACTERISTIC_UUID "d792d09f-1d6e-422b-991a-e2933e7d848b"
 
@@ -308,7 +362,6 @@ void syncTimeFromMesh(uint32_t remoteTimestamp, uint8_t remoteFlags);
 void syncWithGPS();
 float readBatteryVoltage();
 int calculateBatteryLevel(float voltage);
-bool isSOS();
 void setupPowerSaving();
 void sleepLoRa();
 void wakeLoRa();
@@ -429,9 +482,13 @@ void enterDeepSleep()
   digitalWrite(ADC_CTRL_PIN, LOW);
   digitalWrite(TFT_BL, LOW);
 
+  // Вимикаємо статусний діод перед сном
+  digitalWrite(STATUS_LED_PIN, LOW);
+
   gpio_hold_en((gpio_num_t)VEXT_PIN);
   gpio_hold_en((gpio_num_t)ADC_CTRL_PIN);
   gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_hold_en((gpio_num_t)STATUS_LED_PIN); // Утримуємо діод вимкненим
 
   gpio_reset_pin((gpio_num_t)TFT_MOSI);
   gpio_reset_pin((gpio_num_t)TFT_SCLK);
@@ -817,6 +874,7 @@ void setup()
   gpio_hold_dis((gpio_num_t)TFT_BL);
   gpio_hold_dis((gpio_num_t)RADIO_CS_PIN);
   gpio_hold_dis((gpio_num_t)RADIO_RST_PIN);
+  gpio_hold_dis((gpio_num_t)STATUS_LED_PIN); // Звільняємо діод від утримання
   gpio_deep_sleep_hold_dis();
 
   rtc_gpio_deinit((gpio_num_t)POWER_SWITCH_PIN);
@@ -837,6 +895,10 @@ void setup()
 
   pinMode(ADC_CTRL_PIN, OUTPUT);
   digitalWrite(ADC_CTRL_PIN, LOW);
+
+  // Налаштування статусного діода
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
 
   pinMode(BTN, INPUT_PULLUP);
   pinMode(BLE_SWITCH_PIN, INPUT_PULLUP);
@@ -965,6 +1027,9 @@ bool aesCtrEncryptDecrypt(const uint8_t *input, uint8_t *output, size_t length, 
 // ==========================================
 void loop()
 {
+  // Перевіряємо та оновлюємо стан діода
+  updateStatusLED();
+
   if (digitalRead(POWER_SWITCH_PIN) == HIGH)
   {
     delay(50);
@@ -1018,6 +1083,7 @@ void loop()
   {
     dnsServer.processNextRequest();
     server.handleClient();
+    updateStatusLED(); // Оновлюємо діод і тут, щоб він правильно блимав у режимі WiFi
     delay(5);
     return;
   }
